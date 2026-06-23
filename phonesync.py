@@ -3,17 +3,17 @@
 phonesync — Sync photos, downloads, and recordings from Android phones via ADB.
 
 Supports two phones merging into one photo library, with:
-  - Date-based photo organization (from EXIF or file timestamp)
+  - Move/sort tracking (bidirectional)
+  - Date-based photo organization (from EXIF with fallback to file timestamp)
   - Collision-safe file naming (keeps duplicates by default)
   - Recursive directory scanning with exclude patterns
-  - Move/sort tracking (bidirectional)
   - Safe delete behavior (phone deletes don't remove from computer)
 
 Usage:
-  phonesync sync [--device SERIAL] [--dry-run]
-  phonesync status
   phonesync devices
   phonesync config --init [--config-dir DIR] [--data-dir DIR]
+  phonesync sync [--device SERIAL] [--dry-run]
+  phonesync status
   phonesync detect-paths [--device SERIAL]
   phonesync reset-state [--device SERIAL]
 """
@@ -55,6 +55,7 @@ DEFAULT_PHONE_SOURCES = {
         "/sdcard/DCIM/Camera",
         "/sdcard/DCIM/Screenshots",
         "/sdcard/Pictures",
+        "/sdcard/Movies",
     ],
     "downloads": [
         "/sdcard/Download",
@@ -111,6 +112,7 @@ def default_config(config_dir: str = None, data_dir: str = None):
         "preserve_phone_subdirs": True,  # Maintain subdirectory structure from phone
         "exclude_dirs": DEFAULT_EXCLUDE_DIRS,
         "exclude_files": DEFAULT_EXCLUDE_FILES,
+        "followlinks": "Hardcoded_True",
         "delete_from_phone_after_sync": False,
         "propagate_computer_deletes_to_phone": False,
         "conflict_resolution": "prefer_computer",
@@ -223,9 +225,11 @@ class DeviceState:
             json.dump(data, f, indent=2)
 
     def add_file(self, computer_relpath: str, phone_path: str,
-                 file_hash: str, size: int, phone_mtime: str, category: str):
+                 file_hash: str, size: int, phone_mtime: str, category: str,
+                 phone_source_dir: str = ""):
         self.files[computer_relpath] = {
             "phone_path": phone_path,
+            "phone_source_dir": phone_source_dir,
             "hash": file_hash,
             "size": size,
             "phone_mtime": phone_mtime,
@@ -624,6 +628,8 @@ class SyncEngine:
         logging.info(f"Registered new device: {name} ({model}) [{self.device_serial}]")
         return name
 
+
+    ## TODO study this
     def _get_sources(self) -> dict:
         dev_cfg = self.cfg.get("devices", {}).get(self.device_serial, {})
         return dev_cfg.get("sources", DEFAULT_PHONE_SOURCES)
@@ -642,15 +648,16 @@ class SyncEngine:
                             phone_relpath: str) -> Path:
         """Compute destination path for a photo.
 
+        Photos go into photos/YYYY/ based on EXIF or filename date.
         If the file came from a subdirectory (e.g. KakaoTalk/), we preserve
-        that structure under the date folder.
+        that structure under the year folder.
         """
         base = self.data_dir / "photos"
 
         if self.cfg.get("photo_date_folders", True):
             date = get_photo_date(local_tmp)
             if date:
-                date_dir = base / str(date.year) / f"{date.month:02d}"
+                date_dir = base / str(date.year)
             else:
                 date_dir = base / "unsorted"
         else:
@@ -809,7 +816,7 @@ class SyncEngine:
                 self.state.add_file(
                     existing_by_hash[0], phone_path, local_hash,
                     size, datetime.fromtimestamp(finfo["mtime_epoch"]).isoformat(),
-                    category)
+                    category, phone_source_dir=phone_dir)
                 self.stats["files_skipped"] += 1
                 continue
             elif existing_by_hash:
@@ -836,7 +843,8 @@ class SyncEngine:
             relpath = str(dest_path.relative_to(self.data_dir))
             mtime_iso = datetime.fromtimestamp(finfo["mtime_epoch"]).isoformat()
             self.state.add_file(
-                relpath, phone_path, local_hash, size, mtime_iso, category)
+                relpath, phone_path, local_hash, size, mtime_iso, category,
+                phone_source_dir=phone_dir)
 
             self.stats["files_copied"] += 1
             self.stats["bytes_copied"] += size
@@ -867,7 +875,8 @@ class SyncEngine:
                 continue
 
             file_hash = info["hash"]
-            new_path = self._find_file_by_hash(file_hash, info["category"])
+            new_path = self._find_file_by_hash(file_hash,
+                                                previous_path=computer_path)
 
             if new_path:
                 new_relpath = str(new_path.relative_to(self.data_dir))
@@ -887,18 +896,51 @@ class SyncEngine:
                 old_info["synced_at"] = datetime.now().isoformat()
                 self.state.files[new_relpath] = old_info
 
-                # Propagate to phone if photo was sorted into subfolder
+                # Propagate to phone: figure out what subfolder the file
+                # is now in relative to data_dir, strip auto-generated
+                # components (photos/, year folders), and mirror the
+                # remaining meaningful structure to the phone.
                 if info["category"] == "photos":
                     phone_path = info["phone_path"]
-                    phone_dir = os.path.dirname(phone_path)
+                    phone_source = info.get("phone_source_dir", "")
+                    if not phone_source:
+                        phone_source = os.path.dirname(phone_path)
                     phone_filename = os.path.basename(phone_path)
 
-                    old_parts = Path(relpath).parts
-                    new_parts = Path(new_relpath).parts
+                    # Get path relative to data_dir
+                    # e.g. "photos/2025/birthday_with_friends/IMG.jpg"
+                    # or "undergrad/2015/birthday/IMG.jpg"
+                    rel = new_path.relative_to(self.data_dir)
+                    subfolder_parts = list(rel.parent.parts)
 
-                    if len(new_parts) > len(old_parts):
-                        extra = "/".join(new_parts[len(old_parts)-1:-1])
-                        new_phone_path = f"{phone_dir}/{extra}/{phone_filename}"
+                    # Strip auto-generated leading structure only:
+                    #   "photos/" prefix and the year folder directly
+                    #   under it (e.g. photos/2025/) since those are
+                    #   created by phonesync during ingest.
+                    #
+                    # But DON'T strip years deeper in the tree — those
+                    # are user-created (e.g. undergrad/2015/birthday/).
+                    meaningful = list(subfolder_parts)  # start with all
+                    if meaningful and meaningful[0] == "photos":
+                        meaningful.pop(0)
+                        # Strip the year directly after "photos/"
+                        if meaningful and re.match(r'^\d{4}$', meaningful[0]):
+                            meaningful.pop(0)
+                    # Also strip "unsorted" if it's the leading element
+                    if meaningful and meaningful[0] == "unsorted":
+                        meaningful.pop(0)
+
+                    if meaningful:
+                        extra = "/".join(meaningful)
+                        new_phone_path = (
+                            f"{phone_source}/{extra}/{phone_filename}")
+                    else:
+                        # No meaningful subfolder — file is in a year root
+                        # or photos root. Move back to phone source dir.
+                        new_phone_path = (
+                            f"{phone_source}/{phone_filename}")
+
+                    if new_phone_path != phone_path:
                         moves_to_apply.append(
                             (phone_path, new_phone_path, new_relpath))
 
@@ -919,29 +961,85 @@ class SyncEngine:
                 self.stats["errors"] += 1
 
     def _find_file_by_hash(self, target_hash: str,
-                           category: str) -> Optional[Path]:
-        if category == "photos":
-            search_dir = self.data_dir / "photos"
-        elif category == "downloads":
-            search_dir = self.data_dir / "downloads"
-        elif category == "recordings":
-            search_dir = self.data_dir / "recordings"
-        else:
-            search_dir = self.data_dir
+                           previous_path: Path = None) -> Optional[Path]:
+        """Search for a file by hash with priority ordering.
 
-        if not search_dir.exists():
+        Search order (to handle hash collisions gracefully):
+          1. The directory the file was previously in
+          2. Subdirectories of the previous directory
+          3. Parent directories walking upward toward data_dir
+          4. Everything else under data_dir
+
+        Args:
+            target_hash: SHA256 hash to search for.
+            previous_path: The last known full path of the file (used to
+                determine search priority). If None, searches all of
+                data_dir with no priority.
+        """
+        if not self.data_dir.exists():
             return None
 
-        for root, dirs, files in os.walk(search_dir):
-            dirs[:] = [d for d in dirs if not d.startswith(".")]
-            for fname in files:
-                fpath = Path(root) / fname
-                try:
-                    if file_sha256(str(fpath)) == target_hash:
-                        return fpath
-                except (OSError, IOError):
-                    continue
-        return None
+        searched = set()  # track searched dirs to avoid re-walking
+
+        def _check_file(fpath: Path) -> bool:
+            try:
+                return file_sha256(str(fpath)) == target_hash
+            except (OSError, IOError):
+                return False
+
+        def _scan_dir_only(directory: Path) -> Optional[Path]:
+            """Check only immediate files in a directory (non-recursive)."""
+            if not directory.is_dir() or str(directory) in searched:
+                return None
+            searched.add(str(directory))
+            try:
+                for item in directory.iterdir():
+                    if item.is_file() and _check_file(item):
+                        return item
+            except (OSError, PermissionError):
+                pass
+            return None
+
+        def _scan_recursive(directory: Path) -> Optional[Path]:
+            """Recursively search a directory, skipping already-searched dirs."""
+            if not directory.is_dir():
+                return None
+            for root, dirs, files in os.walk(directory, followlinks=True):
+                dirs[:] = [d for d in dirs if not d.startswith(".")
+                           and str(Path(root) / d) not in searched]
+                if str(root) not in searched:
+                    searched.add(str(root))
+                    for fname in files:
+                        fpath = Path(root) / fname
+                        if _check_file(fpath):
+                            return fpath
+            return None
+
+        if previous_path:
+            prev_dir = previous_path.parent
+
+            # Priority 1: Previous directory (flat scan)
+            result = _scan_dir_only(prev_dir)
+            if result:
+                return result
+
+            # Priority 2: Subdirectories of previous directory
+            result = _scan_recursive(prev_dir)
+            if result:
+                return result
+
+            # Priority 3: Walk up toward data_dir
+            current = prev_dir.parent
+            while current >= self.data_dir:
+                result = _scan_dir_only(current)
+                if result:
+                    return result
+                if current == self.data_dir:
+                    break
+                current = current.parent
+
+        # Priority 4: Everything else under data_dir
+        return _scan_recursive(self.data_dir)
 
     def _print_summary(self):
         s = self.stats
