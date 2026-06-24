@@ -280,7 +280,6 @@ class DeviceState:
                 data = json.load(f)
             self.files = data.get("files", {})
             self.last_sync = data.get("last_sync")
-        # Else error and crash quickly? crash safely?
 
     def save(self):
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -368,7 +367,7 @@ class ADB:
     def list_files_recursive(self, remote_dir: str,
                              exclude_dirs: list[str] = None,
                              exclude_files: list[str] = None,
-                             max_depth: int = 255) -> list[dict]:
+                             max_depth: int = 255) -> list[dict]: # FAT max
         """
         Recursively list files in a directory on the phone.
         Returns list of {name, size, mtime_epoch, path, relpath}.
@@ -388,21 +387,34 @@ class ADB:
             return []
 
         # Build find command with exclusions
+        # Use printf with \0 field separators for safe filename handling.
+        # Output format per file: "size\0mtime\0filepath\n"
+        # \0 is the only character illegal in filenames on both Linux and
+        # Android, so this is guaranteed safe regardless of filename content.
         prune_clauses = []
         for ed in exclude_dirs:
             prune_clauses.append(f'-name {q(ed)} -prune')
+
+        # Use sh -c with {} + for batching (faster than \;)
+        stat_script = (
+            'for f; do '
+            's=$(stat -c %s "$f") && '
+            'm=$(stat -c %Y "$f") && '
+            'printf "%s\\0%s\\0%s\\n" "$s" "$m" "$f"; '
+            'done'
+        )
 
         if prune_clauses:
             prune_expr = " -o ".join(prune_clauses)
             find_cmd = (
                 f'find {q(remote_dir)} -maxdepth {max_depth} '
                 f'\\( {prune_expr} \\) -o '
-                f'-type f -exec stat -c "%s|%Y|%n" {{}} \\;'
+                f'-type f -exec sh -c {q(stat_script)} _ {{}} +'
             )
         else:
             find_cmd = (
                 f'find {q(remote_dir)} -maxdepth {max_depth} '
-                f'-type f -exec stat -c "%s|%Y|%n" {{}} \\;'
+                f'-type f -exec sh -c {q(stat_script)} _ {{}} +'
             )
 
         output = self.shell(find_cmd, check=False, timeout=300)
@@ -410,9 +422,9 @@ class ADB:
 
         for line in output.strip().split("\n"):
             line = line.strip()
-            if not line or "|" not in line:
+            if not line or "\0" not in line:
                 continue
-            parts = line.split("|", 2)
+            parts = line.split("\0", 2)
             if len(parts) != 3:
                 continue
             try:
