@@ -367,7 +367,7 @@ class ADB:
     def list_files_recursive(self, remote_dir: str,
                              exclude_dirs: list[str] = None,
                              exclude_files: list[str] = None,
-                             max_depth: int = 255) -> list[dict]: # FAT max
+                             max_depth: int = 255) -> list[dict]:
         """
         Recursively list files in a directory on the phone.
         Returns list of {name, size, mtime_epoch, path, relpath}.
@@ -798,14 +798,16 @@ def safe_filename(dest_dir: Path, name: str, device_name: str = "") -> Path:
 # ---------------------------------------------------------------------------
 
 class SyncEngine:
-    def __init__(self, cfg: dict, device_serial: str, dry_run: bool = False):
+    def __init__(self, cfg: dict, device_serial: str, dry_run: bool = False,
+                 adb_cls=None):
         self.cfg = cfg
         self.data_dir = get_data_dir(cfg)
         self.dry_run = dry_run
         self.device_serial = device_serial
+        self.adb_cls = adb_cls or ADB
 
         self.device_name = self._resolve_device_name()
-        self.adb = ADB(device_serial)
+        self.adb = self.adb_cls(device_serial)
         self.state = DeviceState(device_serial, self.device_name, cfg)
 
         self.stats = {
@@ -829,7 +831,7 @@ class SyncEngine:
             return devices_cfg[self.device_serial]["name"]
 
         existing_names = {d["name"] for d in devices_cfg.values()}
-        model = ADB(self.device_serial).get_model()
+        model = self.adb_cls(self.device_serial).get_model()
         name = re.sub(r'[^a-zA-Z0-9]', '-', model).lower().strip('-')
         if not name:
             name = "phone"

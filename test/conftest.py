@@ -8,12 +8,14 @@ import fnmatch
 import hashlib
 import json
 import os
+import shlex
 import shutil
 import sys
 import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 try:
     import pytest
@@ -21,9 +23,7 @@ try:
 except ImportError:
     HAS_PYTEST = False
 
-# Add parent directory to path so we can import phonesync
 sys.path.insert(0, str(Path(__file__).parent.parent))
-
 import phonesync
 
 
@@ -34,17 +34,23 @@ import phonesync
 class FakeADB:
     """Drop-in replacement for phonesync.ADB that operates on local dirs.
 
-    Each instance is bound to a root directory that represents /sdcard
-    on the phone. All paths passed to methods are treated as absolute
-    paths on the "phone" and mapped to local paths under self.root.
+    Design principles:
+      - Raises NotImplementedError for unsupported shell commands
+        (fail loudly, not silently)
+      - Parses shlex-quoted paths to match real ADB quoting behavior
+      - Models external storage for detect-paths tests
     """
 
-    # Class-level registry: serial -> root directory
-    _registry: dict[str, Path] = {}
+    _registry: dict[str, dict] = {}
 
     @classmethod
-    def register(cls, serial: str, root: Path, model: str = "FakePhone"):
-        cls._registry[serial] = {"root": root, "model": model}
+    def register(cls, serial: str, root: Path, model: str = "FakePhone",
+                 external_sd: Path = None):
+        cls._registry[serial] = {
+            "root": root,
+            "model": model,
+            "external_sd": external_sd,
+        }
 
     @classmethod
     def reset_registry(cls):
@@ -57,129 +63,252 @@ class FakeADB:
         info = self._registry[serial]
         self.root = info["root"]
         self.model = info["model"]
+        self.external_sd = info.get("external_sd")
 
     @staticmethod
     def _q(path: str) -> str:
-        return path  # no quoting needed for local ops
+        return shlex.quote(path)
 
     def _local(self, remote_path: str) -> Path:
         """Map a phone-absolute path to a local path under self.root."""
-        # Strip leading /sdcard/ or /storage/emulated/0/
         rel = remote_path
         for prefix in ("/sdcard/", "/storage/emulated/0/"):
             if rel.startswith(prefix):
                 rel = rel[len(prefix):]
                 break
+        # Handle external SD
+        if self.external_sd and rel.startswith("/storage/"):
+            # e.g. /storage/ABCD-1234/DCIM/...
+            parts = rel.split("/", 3)  # ['', 'storage', 'ABCD-1234', rest]
+            if len(parts) >= 4:
+                return self.external_sd / parts[3]
+            return self.external_sd
         if rel.startswith("/"):
             rel = rel[1:]
         return self.root / rel
 
+    def _unquote(self, token: str) -> str:
+        """Unquote a shlex-quoted path."""
+        # shlex.split handles all quoting styles
+        try:
+            parts = shlex.split(token)
+            return parts[0] if parts else token
+        except ValueError:
+            return token.strip("'\"")
+
+    def _run(self, args, check=True, capture=True, timeout=120):
+        """Not used by FakeADB — shell() handles everything."""
+        raise NotImplementedError("FakeADB._run() not implemented")
+
     def shell(self, cmd: str, check=True, timeout=120) -> str:
-        """Not fully implemented — only supports specific patterns."""
-        # Support [ -d ... ] && echo EXISTS || echo MISSING
-        if "EXISTS" in cmd and "MISSING" in cmd:
-            import re
-            m = re.search(r'\[ -[de] (.+?) \]', cmd)
-            if m:
-                path = m.group(1).strip("'\"")
-                local = self._local(path)
-                if "-d" in cmd[:20]:
-                    return "EXISTS" if local.is_dir() else "MISSING"
-                return "EXISTS" if local.exists() else "MISSING"
-        # Support sha256sum
+        """Execute a shell command against the local fake filesystem.
+
+        Supports the specific command patterns used by phonesync.
+        Raises NotImplementedError for unrecognized commands.
+        """
+        cmd = cmd.strip()
+
+        # --- Piped commands: handle the pipe first ---
+        if "|" in cmd:
+            return self._shell_piped(cmd, check, timeout)
+
+        # --- [ -d path ] && echo EXISTS || echo MISSING ---
+        if cmd.startswith("[ -d ") or cmd.startswith("[ -e "):
+            return self._shell_test(cmd)
+
+        # --- stat -c ---
+        if cmd.startswith("stat -c "):
+            return self._shell_stat(cmd)
+
+        # --- sha256sum ---
         if cmd.startswith("sha256sum "):
-            path = cmd.split(None, 1)[1].strip("'\"")
-            local = self._local(path)
-            if local.exists():
-                h = hashlib.sha256(local.read_bytes()).hexdigest()
-                return f"{h}  {path}"
-            return ""
-        # Support stat -c %s / %Y
-        if "stat -c" in cmd:
-            import re
-            m = re.search(r'stat -c (%\w+) (.+)', cmd)
-            if m:
-                fmt, path = m.group(1), m.group(2).strip("'\"")
-                local = self._local(path)
-                if local.exists():
-                    st = local.stat()
-                    if fmt == "%s":
-                        return str(st.st_size)
-                    elif fmt == "%Y":
-                        return str(int(st.st_mtime))
-            return ""
-        # Support mkdir -p
+            return self._shell_sha256(cmd)
+
+        # --- mkdir -p ---
         if cmd.startswith("mkdir -p "):
-            path = cmd.split(None, 2)[2].strip("'\"")
-            self._local(path).mkdir(parents=True, exist_ok=True)
-            return ""
-        # Support rm
-        if cmd.startswith("rm ") and "-f" not in cmd:
-            path = cmd.split(None, 1)[1].strip("'\"")
-            local = self._local(path)
-            if local.exists():
-                local.unlink()
-            elif check:
-                raise phonesync.ADBError(f"rm: {path}: No such file")
-            return ""
-        if cmd.startswith("rm -f "):
-            path = cmd.split(None, 2)[2].strip("'\"")
-            local = self._local(path)
-            local.unlink(missing_ok=True)
-            return ""
-        # Support cp
+            return self._shell_mkdir(cmd)
+
+        # --- rm / rm -f ---
+        if cmd.startswith("rm "):
+            return self._shell_rm(cmd, check)
+
+        # --- cp ---
         if cmd.startswith("cp "):
-            parts = cmd.split()
-            src = parts[1].strip("'\"")
-            dst = parts[2].strip("'\"")
-            local_src = self._local(src)
-            local_dst = self._local(dst)
-            local_dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(str(local_src), str(local_dst))
-            return ""
-        # Support mv
+            return self._shell_cp(cmd)
+
+        # --- mv ---
         if cmd.startswith("mv "):
-            parts = cmd.split()
-            src = parts[1].strip("'\"")
-            dst = parts[2].strip("'\"")
-            local_src = self._local(src)
-            local_dst = self._local(dst)
-            local_dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(local_src), str(local_dst))
-            return ""
-        # Support getprop
-        if "getprop ro.product.model" in cmd:
-            return self.model
-        # Support find
+            return self._shell_mv(cmd)
+
+        # --- find ---
         if cmd.startswith("find "):
-            return self._handle_find(cmd)
-        # Support ls
-        if cmd.startswith("ls "):
+            return self._shell_find(cmd)
+
+        # --- getprop ---
+        if cmd.startswith("getprop "):
+            if "ro.product.model" in cmd:
+                return self.model
             return ""
-        # Support wc -l piped from find
-        if "wc -l" in cmd:
-            # Extract find part before the pipe
-            find_part = cmd.split("|")[0].strip()
-            if find_part.startswith("find "):
-                result = self._handle_find(find_part)
-                count = len([l for l in result.strip().split("\n")
-                             if l.strip()])
-                return str(count)
-            return "0"
+
+        # --- ls ---
+        if cmd.startswith("ls "):
+            return self._shell_ls(cmd)
+
+        raise NotImplementedError(
+            f"FakeADB.shell() does not support command: {cmd!r}")
+
+    def _shell_piped(self, cmd: str, check: bool, timeout: int) -> str:
+        """Handle piped commands like 'find ... | wc -l'."""
+        parts = cmd.split("|", 1)
+        left = parts[0].strip()
+        right = parts[1].strip()
+
+        left_output = self.shell(left, check=check, timeout=timeout)
+
+        if right == "wc -l":
+            lines = [l for l in left_output.strip().split("\n") if l.strip()]
+            return str(len(lines))
+        if right.startswith("head"):
+            import re
+            m = re.search(r'-(\d+)', right)
+            n = int(m.group(1)) if m else 10
+            lines = left_output.strip().split("\n")
+            return "\n".join(lines[:n])
+
+        raise NotImplementedError(
+            f"FakeADB.shell() does not support pipe RHS: {right!r}")
+
+    def _shell_test(self, cmd: str) -> str:
+        """Handle [ -d path ] / [ -e path ] tests."""
+        # Parse: [ -d '/path' ] && echo EXISTS || echo MISSING
+        try:
+            tokens = shlex.split(cmd.split("]")[0].replace("[", "").strip())
+        except ValueError:
+            return "MISSING"
+        # tokens like ['-d', '/path']
+        if len(tokens) >= 2:
+            flag = tokens[0]
+            path = tokens[1]
+            local = self._local(path)
+            if flag == "-d":
+                return "EXISTS" if local.is_dir() else "MISSING"
+            elif flag == "-e":
+                return "EXISTS" if local.exists() else "MISSING"
+        return "MISSING"
+
+    def _shell_stat(self, cmd: str) -> str:
+        """Handle stat -c <format> <path>."""
+        # stat -c %s '/path' or stat -c '%s' '/path'
+        rest = cmd[len("stat -c "):].strip()
+        try:
+            tokens = shlex.split(rest)
+        except ValueError:
+            return ""
+        if len(tokens) < 2:
+            return ""
+        fmt = tokens[0]
+        path = tokens[1]
+        local = self._local(path)
+        if not local.exists():
+            return ""
+        st = local.stat()
+        if fmt == "%s":
+            return str(st.st_size)
+        elif fmt == "%Y":
+            return str(int(st.st_mtime))
+        elif fmt == "%s %Y":
+            return f"{st.st_size} {int(st.st_mtime)}"
         return ""
 
-    def _handle_find(self, cmd: str) -> str:
-        """Handle find commands on local filesystem."""
+    def _shell_sha256(self, cmd: str) -> str:
+        """Handle sha256sum <path>."""
+        rest = cmd[len("sha256sum "):].strip()
+        path = self._unquote(rest)
+        local = self._local(path)
+        if local.exists():
+            h = hashlib.sha256(local.read_bytes()).hexdigest()
+            return f"{h}  {path}"
+        return ""
+
+    def _shell_mkdir(self, cmd: str) -> str:
+        """Handle mkdir -p <path>."""
+        rest = cmd[len("mkdir -p "):].strip()
+        path = self._unquote(rest)
+        self._local(path).mkdir(parents=True, exist_ok=True)
+        return ""
+
+    def _shell_rm(self, cmd: str, check: bool) -> str:
+        """Handle rm [-f] <path>."""
+        force = "-f" in cmd
+        # Extract path (last token)
+        rest = cmd[len("rm "):].strip()
+        if rest.startswith("-f "):
+            rest = rest[3:].strip()
+        path = self._unquote(rest)
+        local = self._local(path)
+        if local.exists():
+            local.unlink()
+        elif not force and check:
+            raise phonesync.ADBError(f"rm: {path}: No such file")
+        return ""
+
+    def _shell_cp(self, cmd: str) -> str:
+        """Handle cp <src> <dst>."""
+        rest = cmd[len("cp "):].strip()
+        try:
+            tokens = shlex.split(rest)
+        except ValueError:
+            raise phonesync.ADBError(f"cp: parse error: {rest}")
+        if len(tokens) < 2:
+            raise phonesync.ADBError(f"cp: missing operand")
+        src_path = tokens[-2]
+        dst_path = tokens[-1]
+        local_src = self._local(src_path)
+        local_dst = self._local(dst_path)
+        if not local_src.exists():
+            raise phonesync.ADBError(f"cp: {src_path}: No such file")
+        local_dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(str(local_src), str(local_dst))
+        return ""
+
+    def _shell_mv(self, cmd: str) -> str:
+        """Handle mv <src> <dst>."""
+        rest = cmd[len("mv "):].strip()
+        try:
+            tokens = shlex.split(rest)
+        except ValueError:
+            raise phonesync.ADBError(f"mv: parse error: {rest}")
+        if len(tokens) < 2:
+            raise phonesync.ADBError(f"mv: missing operand")
+        src_path = tokens[-2]
+        dst_path = tokens[-1]
+        local_src = self._local(src_path)
+        local_dst = self._local(dst_path)
+        if not local_src.exists():
+            raise phonesync.ADBError(f"mv: {src_path}: No such file")
+        local_dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(local_src), str(local_dst))
+        return ""
+
+    def _shell_find(self, cmd: str) -> str:
+        """Handle find commands."""
         import re
-        # Extract directory
-        parts = cmd.split()
-        if len(parts) < 2:
-            return ""
-        # Find the directory (first non-option argument after 'find')
+
+        # Extract directory (first shlex token after 'find')
+        # This is tricky because find commands have complex syntax.
+        # We parse known flags rather than trying to shlex the whole thing.
+        rest = cmd[len("find "):].strip()
+
+        # Extract the directory (first non-option token)
         directory = None
-        for p in parts[1:]:
-            if not p.startswith("-") and not p.startswith("\\"):
-                directory = p.strip("'\"")
+        try:
+            tokens = shlex.split(rest)
+        except ValueError:
+            tokens = rest.split()
+
+        for t in tokens:
+            if not t.startswith("-") and not t.startswith("\\"):
+                directory = t
                 break
         if not directory:
             return ""
@@ -187,41 +316,50 @@ class FakeADB:
         if not local_dir.is_dir():
             return ""
 
-        # Check for -maxdepth
+        # Parse options
         max_depth = 999
-        if "-maxdepth" in cmd:
-            m = re.search(r'-maxdepth\s+(\d+)', cmd)
-            if m:
-                max_depth = int(m.group(1))
+        m = re.search(r'-maxdepth\s+(\d+)', cmd)
+        if m:
+            max_depth = int(m.group(1))
 
-        # Check for -type d or -type f
         type_filter = None
         if "-type d" in cmd:
             type_filter = "d"
         elif "-type f" in cmd:
             type_filter = "f"
 
-        # Check for -exec with stat/printf (our null-separated format)
+        # Check for our printf+stat pattern (null-separated format)
         if "printf" in cmd and "stat" in cmd:
-            # Our null-byte separated format
-            lines = []
-            for root, dirs, files in os.walk(str(local_dir)):
-                depth = str(root).count(os.sep) - str(local_dir).count(os.sep)
-                if depth >= max_depth:
-                    dirs.clear()
-                    continue
-                if type_filter == "f":
-                    for fname in files:
-                        fpath = Path(root) / fname
-                        # Map back to phone path
-                        rel = fpath.relative_to(self.root)
-                        phone_path = f"/sdcard/{rel}"
-                        st = fpath.stat()
-                        lines.append(
-                            f"{st.st_size}\0{int(st.st_mtime)}\0{phone_path}")
-            return "\n".join(lines)
+            return self._find_with_stat(local_dir, directory,
+                                         max_depth, type_filter)
 
         # Simple find: return paths
+        return self._find_simple(local_dir, directory,
+                                  max_depth, type_filter)
+
+    def _find_with_stat(self, local_dir: Path, phone_base: str,
+                        max_depth: int, type_filter: str) -> str:
+        """Handle find -exec sh -c 'printf ... stat ...' pattern."""
+        lines = []
+        for root, dirs, files in os.walk(str(local_dir)):
+            depth = str(root).count(os.sep) - str(local_dir).count(os.sep)
+            if depth >= max_depth:
+                dirs.clear()
+                continue
+            if type_filter != "f":
+                continue
+            for fname in files:
+                fpath = Path(root) / fname
+                rel_to_root = fpath.relative_to(self.root)
+                phone_path = f"/sdcard/{rel_to_root}"
+                st = fpath.stat()
+                lines.append(
+                    f"{st.st_size}\0{int(st.st_mtime)}\0{phone_path}")
+        return "\n".join(lines)
+
+    def _find_simple(self, local_dir: Path, phone_base: str,
+                     max_depth: int, type_filter: str) -> str:
+        """Handle simple find commands returning path lists."""
         results = []
         for root, dirs, files in os.walk(str(local_dir)):
             depth = str(root).count(os.sep) - str(local_dir).count(os.sep)
@@ -231,11 +369,11 @@ class FakeADB:
             rel = Path(root).relative_to(self.root)
             phone_path = f"/sdcard/{rel}"
             if type_filter == "d":
-                results.append(phone_path)
+                if depth == 0:
+                    results.append(phone_path)
                 for d in dirs:
-                    if depth + 1 < max_depth:
-                        d_rel = (Path(root) / d).relative_to(self.root)
-                        results.append(f"/sdcard/{d_rel}")
+                    d_rel = (Path(root) / d).relative_to(self.root)
+                    results.append(f"/sdcard/{d_rel}")
             elif type_filter == "f":
                 for fname in files:
                     f_rel = (Path(root) / fname).relative_to(self.root)
@@ -244,10 +382,36 @@ class FakeADB:
                 results.append(phone_path)
         return "\n".join(results)
 
+    def _shell_ls(self, cmd: str) -> str:
+        """Handle ls commands."""
+        # Support ls -1 /path/ and ls -1d /path/*/
+        rest = cmd[len("ls "):].strip()
+        tokens = rest.split()
+        # Find the path (last non-flag token)
+        paths = [t for t in tokens if not t.startswith("-")]
+        if not paths:
+            return ""
+        pattern = paths[0]
+        # Handle glob patterns like /storage/*/
+        if "*" in pattern:
+            import glob
+            phone_dir = os.path.dirname(pattern.replace("*", ""))
+            local_dir = self._local(phone_dir)
+            if not local_dir.is_dir():
+                return ""
+            results = []
+            for item in local_dir.iterdir():
+                if item.is_dir():
+                    rel = item.relative_to(self.root)
+                    results.append(f"/sdcard/{rel}/")
+            return "\n".join(results)
+        return ""
+
+    # --- High-level methods (match ADB interface exactly) ---
+
     def list_files_recursive(self, remote_dir: str,
-                             exclude_dirs=None, exclude_files=None,
-                             max_depth: int = 10) -> list[dict]:
-        """List files recursively, matching real ADB output format."""
+                             exclude_dirs: list[str] = None, exclude_files: list[str] = None,
+                             max_depth: int = 255) -> list[dict]:
         if exclude_dirs is None:
             exclude_dirs = phonesync.DEFAULT_EXCLUDE_DIRS
         if exclude_files is None:
@@ -263,11 +427,9 @@ class FakeADB:
             if depth >= max_depth:
                 dirs.clear()
                 continue
-            # Prune excluded dirs
             dirs[:] = [d for d in dirs if d not in exclude_dirs]
 
             for fname in filenames:
-                # Check exclusion patterns
                 skip = False
                 for pattern in exclude_files:
                     if fnmatch.fnmatch(fname, pattern):
@@ -278,10 +440,8 @@ class FakeADB:
 
                 fpath = Path(root) / fname
                 st = fpath.stat()
-                # Map to phone path
                 rel_to_root = fpath.relative_to(self.root)
                 phone_path = f"/sdcard/{rel_to_root}"
-                # Compute relpath from remote_dir
                 rel_to_dir = fpath.relative_to(local_dir)
                 relpath = str(rel_to_dir)
 
@@ -333,7 +493,7 @@ class FakeADB:
 
     def move_safe(self, remote_src: str, remote_dst: str,
                   expected_hash: str = None) -> dict:
-        """Copy-verify-delete move, matching real ADB.move_safe interface."""
+        """Copy-verify-delete move, matching real ADB.move_safe."""
         result = {"ok": False, "action": "", "source_deleted": False}
         src = self._local(remote_src)
         dst = self._local(remote_dst)
@@ -375,13 +535,13 @@ class FakeADB:
     def file_exists(self, remote_path: str) -> bool:
         return self._local(remote_path).exists()
 
-    def file_mtime(self, remote_path: str):
+    def file_mtime(self, remote_path: str) -> Optional[int]:
         local = self._local(remote_path)
         if local.exists():
             return int(local.stat().st_mtime)
         return None
 
-    def file_hash(self, remote_path: str):
+    def file_hash(self, remote_path: str) -> Optional[str]:
         local = self._local(remote_path)
         if local.exists():
             return hashlib.sha256(local.read_bytes()).hexdigest()
@@ -391,8 +551,19 @@ class FakeADB:
         return self.model
 
     def list_storage_volumes(self) -> list[dict]:
-        return [{"type": "internal", "path": "/sdcard",
-                 "label": "Internal Storage"}]
+        volumes = [{
+            "type": "internal",
+            "path": "/sdcard",
+            "label": "Internal Storage",
+        }]
+        if self.external_sd and self.external_sd.is_dir():
+            volumes.append({
+                "type": "external_sd",
+                "path": "/storage/EXT_SD",
+                "label": "SD Card (EXT_SD)",
+                "id": "EXT_SD",
+            })
+        return volumes
 
 
 # ---------------------------------------------------------------------------
@@ -413,19 +584,13 @@ def fake_list_connected_devices() -> list[dict]:
 class TestHarness:
     """Full test environment with two phones and one computer.
 
-    Sets up temp directories, config, and patches phonesync to use
-    FakeADB. Provides helper methods for writing/reading/moving files.
-
-    Usage:
-        with TestHarness() as h:
-            h.phone_write("a", "DCIM/Camera/IMG.jpg", b"photo data")
-            h.sync("a")
-            assert h.computer_exists("photos/2025/IMG.jpg")
+    Uses dependency injection (adb_cls parameter) for SyncEngine
+    instead of monkey-patching globals. Only patches
+    list_connected_devices for CLI tests.
     """
 
     def __init__(self):
         self.tmpdir = None
-        self._original_adb = None
         self._original_list = None
 
     def __enter__(self):
@@ -437,7 +602,6 @@ class TestHarness:
         self.phone_a_dir.mkdir()
         self.phone_b_dir.mkdir()
 
-        # Create default phone directory structures
         for phone_dir in (self.phone_a_dir, self.phone_b_dir):
             (phone_dir / "DCIM" / "Camera").mkdir(parents=True)
             (phone_dir / "DCIM" / "Screenshots").mkdir(parents=True)
@@ -445,7 +609,6 @@ class TestHarness:
             (phone_dir / "Download").mkdir(parents=True)
             (phone_dir / "Recordings").mkdir(parents=True)
 
-        # Create data and config directories
         self.data_dir = self.tmpdir / "PhoneSync"
         self.cfg_dir = self.tmpdir / "config"
         self.data_dir.mkdir()
@@ -456,14 +619,15 @@ class TestHarness:
         FakeADB.register("SERIAL_A", self.phone_a_dir, "PhoneA")
         FakeADB.register("SERIAL_B", self.phone_b_dir, "PhoneB")
 
-        # Set up fake connected devices
+        # Patch list_connected_devices (still needed for CLI commands)
         global _fake_connected_devices
         _fake_connected_devices = [
             {"serial": "SERIAL_A", "model": "PhoneA"},
             {"serial": "SERIAL_B", "model": "PhoneB"},
         ]
+        self._original_list = phonesync.list_connected_devices
+        phonesync.list_connected_devices = fake_list_connected_devices
 
-        # Create config
         self.cfg = {
             "config_dir": str(self.cfg_dir),
             "data_dir": str(self.data_dir),
@@ -504,25 +668,13 @@ class TestHarness:
             },
         }
         phonesync.save_config(self.cfg)
-
-        # Monkey-patch phonesync to use FakeADB
-        self._original_adb = phonesync.ADB
-        self._original_list = phonesync.list_connected_devices
-        phonesync.ADB = FakeADB
-        phonesync.list_connected_devices = fake_list_connected_devices
-
         return self
 
     def __exit__(self, *args):
-        # Restore originals
-        phonesync.ADB = self._original_adb
         phonesync.list_connected_devices = self._original_list
         FakeADB.reset_registry()
-
         global _fake_connected_devices
         _fake_connected_devices = []
-
-        # Cleanup
         if self.tmpdir and self.tmpdir.exists():
             shutil.rmtree(self.tmpdir, ignore_errors=True)
 
@@ -540,7 +692,6 @@ class TestHarness:
 
     def phone_write(self, phone: str, relpath: str, content: bytes,
                     mtime: float = None):
-        """Write a file to a phone's filesystem."""
         p = self._phone_dir(phone) / relpath
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_bytes(content)
@@ -563,7 +714,6 @@ class TestHarness:
         (self._phone_dir(phone) / relpath).unlink()
 
     def phone_list(self, phone: str, relpath: str = "") -> list[str]:
-        """List all files under a phone path, relative to phone root."""
         base = self._phone_dir(phone) / relpath
         if not base.exists():
             return []
@@ -579,7 +729,6 @@ class TestHarness:
 
     def computer_write(self, relpath: str, content: bytes,
                        mtime: float = None):
-        """Write a file to the computer's data directory."""
         p = self.data_dir / relpath
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_bytes(content)
@@ -602,13 +751,11 @@ class TestHarness:
         (self.data_dir / relpath).unlink()
 
     def computer_list(self, relpath: str = "") -> list[str]:
-        """List all files under a data dir path, relative to data_dir."""
         base = self.data_dir / relpath
         if not base.exists():
             return []
         result = []
         for root, dirs, files in os.walk(str(base)):
-            # Skip config dirs
             dirs[:] = [d for d in dirs if not d.startswith(".")]
             for f in files:
                 rel = str((Path(root) / f).relative_to(self.data_dir))
@@ -618,7 +765,6 @@ class TestHarness:
     # --- State helpers ---
 
     def get_state(self, phone: str) -> dict:
-        """Get the current state dict for a phone."""
         name = "phone-a" if phone == "a" else "phone-b"
         state_path = self.cfg_dir / f"state-{name}.json"
         if state_path.exists():
@@ -633,29 +779,29 @@ class TestHarness:
         return relpath in self.get_state(phone).get("files", {})
 
     def state_phone_path(self, phone: str, relpath: str) -> str:
-        """Get the phone_path for a given computer relpath in state."""
         return self.get_state(phone)["files"][relpath]["phone_path"]
 
     def state_is_tombstoned(self, phone: str, relpath: str) -> bool:
         files = self.get_state(phone).get("files", {})
         return files.get(relpath, {}).get("deleted_from_computer", False)
 
-    # --- Sync ---
+    # --- Sync (uses dependency injection, NOT monkey-patching) ---
 
     def sync(self, phone: str, dry_run: bool = False) -> phonesync.SyncEngine:
-        """Run a full sync for one phone. Returns the engine for inspection."""
+        """Run a full sync using DI (adb_cls=FakeADB)."""
         self.cfg = phonesync.load_config()
         serial = self._phone_serial(phone)
-        engine = phonesync.SyncEngine(self.cfg, serial, dry_run=dry_run)
+        engine = phonesync.SyncEngine(
+            self.cfg, serial, dry_run=dry_run, adb_cls=FakeADB)
         engine.run()
         return engine
 
     def sync_all(self, dry_run: bool = False) -> list[phonesync.SyncEngine]:
-        """Sync both phones."""
         return [self.sync("a", dry_run), self.sync("b", dry_run)]
 
 
-# Pytest fixtures (only defined when pytest is available)
+# ---------------------------------------------------------------------------
+# Pytest fixtures (only if pytest is available)
 # ---------------------------------------------------------------------------
 
 if HAS_PYTEST:
