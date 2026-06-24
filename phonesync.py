@@ -20,7 +20,7 @@ Usage:
   phonesync sync [--device SERIAL] [--dry-run]
   phonesync status
   phonesync detect-paths [--device SERIAL]
-  phonesync reindex [--device SERIAL] [--rehash]
+  phonesync prune-state [--device SERIAL] [--clear-tombstones] [--rehash]
   phonesync reset-state [--device SERIAL]
 """
 
@@ -192,29 +192,42 @@ def _atomic_json_write(path: Path, data: dict):
 
 
 class SyncLock:
-    """File-based lock to prevent concurrent phonesync runs."""
+    """File-based lock to prevent concurrent phonesync runs.
+
+    Uses fcntl advisory locking. The lock file is never deleted — it's
+    a stable inode that all processes open and lock against. Closing
+    the fd (including on crash) automatically releases the lock.
+    """
 
     def __init__(self, cfg_dir: Path):
         self.lock_path = cfg_dir / "sync.lock"
+        self._fd = None
 
     def acquire(self) -> bool:
         self.lock_path.parent.mkdir(parents=True, exist_ok=True)
         try:
-            self._fd = open(self.lock_path, "w")
+            # Open without truncating — we want a stable inode
+            self._fd = open(self.lock_path, "a+")
             fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            # Truncate and write our PID (informational only)
+            self._fd.seek(0)
+            self._fd.truncate()
             self._fd.write(f"{os.getpid()}\n{datetime.now().isoformat()}\n")
             self._fd.flush()
             return True
         except (IOError, OSError):
+            if self._fd:
+                self._fd.close()
+                self._fd = None
             return False
 
     def release(self):
-        try:
-            fcntl.flock(self._fd, fcntl.LOCK_UN)
-            self._fd.close()
-            self.lock_path.unlink(missing_ok=True)
-        except (IOError, OSError, AttributeError):
-            pass
+        if self._fd:
+            try:
+                self._fd.close()  # closing the fd releases the fcntl lock
+            except (IOError, OSError):
+                pass
+            self._fd = None
 
 
 def get_data_dir(cfg: dict) -> Path:
@@ -485,8 +498,12 @@ class ADB:
                   expected_hash: str = None) -> bool:
         """Move a file on the phone with collision check and hash verification.
 
-        Returns True only if the move succeeded and (if expected_hash is
-        provided) the file at the destination matches the expected hash.
+        If the destination already exists with the correct content, returns
+        True (the intent is satisfied) WITHOUT deleting the source — it
+        may be an intentional duplicate the user wants to keep.
+
+        Returns True only if the file exists at the destination with the
+        correct content after this call.
         """
         q = self._q
         # Check if destination already exists
@@ -494,15 +511,14 @@ class ADB:
             f'[ -e {q(remote_dst)} ] && echo EXISTS || echo FREE',
             check=False)
         if "EXISTS" in check:
-            logging.warning(
-                f"  Phone move collision: {remote_dst} already exists")
-            # Check if it's the same file
             if expected_hash:
                 existing_hash = self.file_hash(remote_dst)
                 if existing_hash == expected_hash:
                     logging.info(
-                        f"  Collision is same file, removing source")
-                    self.delete(remote_src)
+                        f"  Destination already has correct content: "
+                        f"{remote_dst}")
+                    # Do NOT delete source — it may be an intentional
+                    # duplicate on the phone
                     return True
             logging.error(
                 f"  Cannot move {remote_src} -> {remote_dst}: "
@@ -816,32 +832,6 @@ class SyncEngine:
             return RECORDING_EXTENSIONS is None or ext in RECORDING_EXTENSIONS
         return True
 
-    def run(self):
-        logging.info(f"{'[DRY RUN] ' if self.dry_run else ''}Starting sync for "
-                     f"{self.device_name} ({self.device_serial})")
-
-        self._phase_ingest()
-        self._phase_detect_phone_moves()
-        self._phase_sync_moves()
-
-        if not self.dry_run:
-            self.state.save()
-
-        self._print_summary()
-
-    def _phase_ingest(self):
-        logging.info("=== Phase 1: Ingesting new files ===")
-        sources = self._get_sources()
-        exclude_dirs = self.cfg.get("exclude_dirs", DEFAULT_EXCLUDE_DIRS)
-        exclude_files = self.cfg.get("exclude_files", DEFAULT_EXCLUDE_FILES)
-        recursive = self.cfg.get("recursive_scan", True)
-
-        for category, dirs in sources.items():
-            for phone_dir in dirs:
-                self._ingest_directory(
-                    phone_dir, category, exclude_dirs, exclude_files,
-                    recursive)
-
     def _check_subdirectories(self, phone_dir: str, category: str,
                                exclude_dirs: list, recursive: bool):
         """Discover subdirectories in a phone source dir and warn about them."""
@@ -875,7 +865,6 @@ class SyncEngine:
                 continue
 
             is_excluded = subdir_name in exclude_dirs
-            # Check if this subdir is itself a configured source
             is_configured = line in all_configured_sources
 
             if is_excluded:
@@ -888,29 +877,137 @@ class SyncEngine:
                     f"  ⚠ Subdirectory not scanned (recursive_scan=false): "
                     f"{line} ({file_count} files)")
             elif not is_configured:
-                # Recursive is on, so files ARE being picked up, but still
-                # worth noting for awareness
                 self.discovered_subdirs.append(
                     (phone_dir, subdir_name, file_count, "scanned"))
 
-    def _ingest_directory(self, phone_dir: str, category: str,
-                          exclude_dirs: list, exclude_files: list,
-                          recursive: bool):
-        logging.info(f"Scanning {phone_dir} ({category})"
-                     f"{' [recursive]' if recursive else ''}...")
+    def run(self):
+        logging.info(f"{'[DRY RUN] ' if self.dry_run else ''}Starting sync for "
+                     f"{self.device_name} ({self.device_serial})")
 
-        if recursive:
-            files = self.adb.list_files_recursive(
-                phone_dir, exclude_dirs=exclude_dirs,
-                exclude_files=exclude_files)
-        else:
-            files = self.adb.list_files(phone_dir)
+        # Scan the phone ONCE — all phases share this snapshot
+        self.phone_scan = self._scan_phone()
 
-        logging.info(f"  Found {len(files)} files")
+        # Phase 1: Detect phone-side moves (must happen before ingest
+        # so moved files aren't re-ingested as new)
+        self._phase_detect_phone_moves()
 
-        # Discover subdirectories and warn about them
-        self._check_subdirectories(phone_dir, category, exclude_dirs, recursive)
+        # Phase 2: Ingest genuinely new files
+        self._phase_ingest()
 
+        # Phase 3: Detect computer-side moves/deletes, propagate to phone
+        self._phase_sync_moves()
+
+        if not self.dry_run:
+            self.state.save()
+
+        self._print_summary()
+
+    def _scan_phone(self) -> dict:
+        """Scan all configured phone source directories once.
+
+        Returns dict keyed by category:
+            {category: [(phone_dir, [file_info, ...]), ...]}
+        where file_info has {name, size, mtime_epoch, path, relpath}.
+
+        Also builds a flat index: phone_path -> file_info
+        """
+        logging.info("=== Scanning phone ===")
+        sources = self._get_sources()
+        exclude_dirs = self.cfg.get("exclude_dirs", DEFAULT_EXCLUDE_DIRS)
+        exclude_files = self.cfg.get("exclude_files", DEFAULT_EXCLUDE_FILES)
+        recursive = self.cfg.get("recursive_scan", True)
+
+        scan = {}  # category -> [(phone_dir, [files])]
+        self._phone_path_index = {}  # phone_path -> file_info
+
+        for category, dirs in sources.items():
+            scan[category] = []
+            for phone_dir in dirs:
+                logging.info(f"  Scanning {phone_dir} ({category})"
+                             f"{' [recursive]' if recursive else ''}...")
+                if recursive:
+                    files = self.adb.list_files_recursive(
+                        phone_dir, exclude_dirs=exclude_dirs,
+                        exclude_files=exclude_files)
+                else:
+                    files = self.adb.list_files(phone_dir)
+
+                logging.info(f"    Found {len(files)} files")
+                scan[category].append((phone_dir, files))
+
+                for finfo in files:
+                    self._phone_path_index[finfo["path"]] = finfo
+
+                # Subdirectory discovery
+                self._check_subdirectories(
+                    phone_dir, category, exclude_dirs, recursive)
+
+        return scan
+
+    def _phase_detect_phone_moves(self):
+        """Phase 1: Detect files that moved on the phone.
+
+        Uses the shared phone scan to find files whose tracked phone_path
+        no longer exists but whose content (by size + hash) is at a new
+        path. Updates state so ingest doesn't re-download them.
+        """
+        logging.info("=== Phase 1: Detecting phone-side moves ===")
+        sources = self._get_sources()
+
+        for relpath, info in list(self.state.files.items()):
+            if info.get("device_name") != self.device_name:
+                continue
+            old_phone_path = info["phone_path"]
+
+            # Is the file still at its expected phone location?
+            if old_phone_path in self._phone_path_index:
+                continue
+
+            # File is gone from expected phone path.
+            # Search for it at a new path by size + hash.
+            file_hash = info["hash"]
+            expected_size = info.get("size", -1)
+            new_phone_path = None
+
+            for ppath, pinfo in self._phone_path_index.items():
+                if pinfo["size"] != expected_size:
+                    continue
+                # Size matches — verify hash on phone
+                phone_hash = self.adb.file_hash(ppath)
+                if phone_hash == file_hash:
+                    new_phone_path = ppath
+                    break
+
+            if new_phone_path:
+                logging.info(
+                    f"  Phone-side move detected: "
+                    f"{old_phone_path} -> {new_phone_path}")
+                self.state.files[relpath]["phone_path"] = new_phone_path
+                # Update phone_source_dir if it changed
+                for category, dirs in sources.items():
+                    for phone_dir in dirs:
+                        if new_phone_path.startswith(phone_dir + "/") or \
+                           new_phone_path == phone_dir:
+                            self.state.files[relpath]["phone_source_dir"] = \
+                                phone_dir
+                            break
+                self.stats["phone_moves_detected"] += 1
+
+    def _phase_ingest(self):
+        """Phase 2: Ingest genuinely new files from phone.
+
+        Only processes phone paths NOT already tracked in state (which
+        now includes paths reconciled by phone-move detection in phase 1).
+        """
+        logging.info("=== Phase 2: Ingesting new files ===")
+
+        for category, dir_scans in self.phone_scan.items():
+            for phone_dir, files in dir_scans:
+                self._ingest_files(phone_dir, category, files)
+
+    def _ingest_files(self, phone_dir: str, category: str,
+                      files: list[dict]):
+        """Ingest files from a single phone directory scan."""
         for finfo in files:
             filename = finfo["name"]
             phone_path = finfo["path"]
@@ -920,12 +1017,19 @@ class SyncEngine:
             if not self._is_relevant_file(filename, category):
                 continue
 
-            # Check if we already track this exact phone path
+            # Check if we already track this phone path
             existing = self.state.find_by_phone_path(phone_path)
             if existing:
+                # Check for tombstone — clear it if file reappeared
+                # at the same phone_path with same content
+                info = self.state.files[existing]
+                if info.get("deleted_from_computer"):
+                    # Tombstoned — skip (user intentionally deleted local)
+                    self.stats["files_skipped"] += 1
+                    continue
+
                 # Compare mtime — re-pull if file changed on phone
-                old_info = self.state.files[existing]
-                old_mtime = old_info.get("phone_mtime", "")
+                old_mtime = info.get("phone_mtime", "")
                 new_mtime_iso = datetime.fromtimestamp(
                     finfo["mtime_epoch"]).isoformat()
                 if old_mtime and old_mtime == new_mtime_iso:
@@ -938,7 +1042,6 @@ class SyncEngine:
                         f"    old={old_mtime}  new={new_mtime_iso}")
                     # Fall through to re-pull
                 else:
-                    # No stored mtime (old state format), skip
                     self.stats["files_skipped"] += 1
                     continue
 
@@ -979,7 +1082,6 @@ class SyncEngine:
                     self.stats["bytes_copied"] += size
                     continue
                 else:
-                    # Old file missing from computer — treat as new copy
                     del self.state.files[existing]
 
             # Check for duplicate by hash
@@ -989,11 +1091,9 @@ class SyncEngine:
             if existing_by_hash and not keep_duplicates:
                 logging.info(f"  Skipping (duplicate by hash): {filename}")
                 tmp_path.unlink(missing_ok=True)
-                # Still record the phone_path -> existing mapping
-                self.state.add_file(
-                    existing_by_hash[0], phone_path, local_hash,
-                    size, datetime.fromtimestamp(finfo["mtime_epoch"]).isoformat(),
-                    category, phone_source_dir=phone_dir)
+                # Do NOT overwrite the existing entry's phone_path —
+                # that would lose the original phone_path tracking.
+                # The duplicate phone_path simply isn't tracked.
                 self.stats["files_skipped"] += 1
                 continue
             elif existing_by_hash:
@@ -1032,79 +1132,31 @@ class SyncEngine:
         if tmp_dir.exists():
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
-    def _phase_detect_phone_moves(self):
-        """Detect files that moved on the phone and update state.
-
-        If a tracked phone_path no longer exists but a file with the same
-        hash is found at a new phone path (from the current scan), update
-        the state's phone_path so we don't re-ingest it as a duplicate.
-        """
-        logging.info("=== Phase 2: Detecting phone-side moves ===")
-        sources = self._get_sources()
-        exclude_dirs = self.cfg.get("exclude_dirs", DEFAULT_EXCLUDE_DIRS)
-        exclude_files = self.cfg.get("exclude_files", DEFAULT_EXCLUDE_FILES)
-
-        # Build a map of all files currently on the phone
-        # phone_path -> {hash, mtime_epoch, size}
-        phone_files = {}
-        for category, dirs in sources.items():
-            for phone_dir in dirs:
-                files = self.adb.list_files_recursive(
-                    phone_dir, exclude_dirs=exclude_dirs,
-                    exclude_files=exclude_files)
-                for finfo in files:
-                    phone_files[finfo["path"]] = finfo
-
-        # Check each tracked file
-        for relpath, info in list(self.state.files.items()):
-            if info.get("device_name") != self.device_name:
-                continue
-            old_phone_path = info["phone_path"]
-
-            # Is the file still at its expected phone location?
-            if old_phone_path in phone_files:
-                continue
-
-            # File is gone from expected phone path.
-            # Check if it re-appeared at a different path (by hash).
-            file_hash = info["hash"]
-            new_phone_path = None
-            for ppath, pinfo in phone_files.items():
-                # Quick size check first (avoid expensive hash)
-                if pinfo["size"] != info.get("size", -1):
-                    continue
-                # Check hash on phone
-                phone_hash = self.adb.file_hash(ppath)
-                if phone_hash == file_hash:
-                    new_phone_path = ppath
-                    break
-
-            if new_phone_path:
-                logging.info(
-                    f"  Phone-side move detected: "
-                    f"{old_phone_path} -> {new_phone_path}")
-                self.state.files[relpath]["phone_path"] = new_phone_path
-                # Update phone_source_dir if it changed
-                for category, dirs in sources.items():
-                    for phone_dir in dirs:
-                        if new_phone_path.startswith(phone_dir):
-                            self.state.files[relpath]["phone_source_dir"] = \
-                                phone_dir
-                            break
-                self.stats["phone_moves_detected"] += 1
-            # else: file deleted from phone — that's fine, we keep it on
-            # computer (safe delete behavior)
-
     def _phase_sync_moves(self):
         """Phase 3: Detect moves on computer, propagate to phone.
 
-        Also reports files deleted from the computer.
+        Also:
+        - Reports files deleted from the computer
+        - Clears tombstones for files that have reappeared
+        - Recomputes desired phone paths for stale moves
         """
         logging.info("=== Phase 3: Detecting computer-side moves ===")
 
         moves_to_apply = []
 
+        # First pass: clear tombstones for files that reappeared
         for relpath, info in list(self.state.files.items()):
+            if info.get("deleted_from_computer"):
+                computer_path = self.data_dir / relpath
+                if computer_path.exists():
+                    logging.info(f"  File reappeared: {relpath}")
+                    del self.state.files[relpath]["deleted_from_computer"]
+
+        # Second pass: detect moves and deletions
+        for relpath, info in list(self.state.files.items()):
+            if info.get("deleted_from_computer"):
+                continue  # already tombstoned from a previous run
+
             computer_path = self.data_dir / relpath
 
             if computer_path.exists():
@@ -1147,13 +1199,10 @@ class SyncEngine:
 
                 self.stats["moves_synced"] += 1
             else:
-                # File deleted from computer — report it
+                # File deleted from computer — tombstone it
                 self.deleted_files.append(
                     (relpath, info.get("category", "unknown")))
                 self.stats["local_deletions"] += 1
-                # Keep the state entry so we don't re-download from phone;
-                # the file is intentionally gone from computer.
-                # Mark it so we know.
                 self.state.files[relpath]["deleted_from_computer"] = True
 
         # Also recompute desired phone paths for files that haven't moved
@@ -1172,7 +1221,6 @@ class SyncEngine:
 
             desired = self._compute_desired_phone_path(computer_path, info)
             if desired and desired != info["phone_path"]:
-                # Check this isn't already queued
                 already_queued = any(
                     m[2] == relpath for m in moves_to_apply)
                 if not already_queued:
@@ -1359,8 +1407,9 @@ class SyncEngine:
                         print(f"      e.g. {os.path.basename(relpath)}")
                     print(f"      ... and {len(files_in_dir) - 3} more")
 
-            print(f"  → These files are preserved on the phone. To remove "
-                  f"from state, run 'phonesync reindex'.")
+            print(f"  → These files won't be re-downloaded from the phone.")
+            print(f"    To re-download them, run: "
+                  f"phonesync prune-state --clear-tombstones")
 
         # Subdirectory report
         if self.discovered_subdirs:
@@ -1631,16 +1680,18 @@ def cmd_config(args):
         print(json.dumps(cfg, indent=2))
 
 
-def cmd_reindex(args):
-    """Rebuild state from files on disk.
+def cmd_prune_state(args):
+    """Remove stale entries from state.
 
-    Scans the data directory and reconciles the state file:
-    - Removes state entries for files that no longer exist on disk
-    - Optionally re-hashes files to update stale hashes
-    - Reports what changed
+    By default, removes entries where the computer file is missing AND
+    no tombstone is set. Tombstoned entries (deleted_from_computer=True)
+    are kept so those files won't be re-downloaded.
 
-    Unlike reset-state, this preserves phone_path mappings for files
-    that still exist, so the next sync won't re-download everything.
+    --clear-tombstones: Also remove tombstoned entries. This means
+        the next sync WILL re-download those files from the phone.
+        Use this if you accidentally deleted files and want them back.
+
+    --rehash: Recompute hashes for files that still exist (slow).
     """
     cfg = load_config()
     cfg_dir = Path(cfg["config_dir"])
@@ -1648,10 +1699,11 @@ def cmd_reindex(args):
 
     devices = cfg.get("devices", {})
     if not devices:
-        print("No devices registered. Nothing to reindex.")
+        print("No devices registered. Nothing to prune.")
         return
 
     target_device = args.device
+    clear_tombstones = args.clear_tombstones
     rehash = args.rehash
 
     for serial, dev_info in devices.items():
@@ -1664,23 +1716,34 @@ def cmd_reindex(args):
             print(f"No state file for {name}, skipping.")
             continue
 
-        print(f"\nReindexing {name}...")
+        print(f"\nPruning state for {name}...")
 
         state = DeviceState(serial, name, cfg)
         original_count = len(state.files)
 
-        removed = 0
+        removed_missing = 0
+        removed_tombstones = 0
         updated = 0
         kept = 0
+        tombstones_kept = 0
 
         for relpath in list(state.files.keys()):
+            info = state.files[relpath]
             computer_path = data_dir / relpath
+            is_tombstoned = info.get("deleted_from_computer", False)
+
             if not computer_path.exists():
-                del state.files[relpath]
-                removed += 1
+                if is_tombstoned and not clear_tombstones:
+                    tombstones_kept += 1
+                elif is_tombstoned:
+                    del state.files[relpath]
+                    removed_tombstones += 1
+                else:
+                    del state.files[relpath]
+                    removed_missing += 1
             elif rehash:
                 new_hash = file_sha256(str(computer_path))
-                if new_hash != state.files[relpath].get("hash"):
+                if new_hash != info.get("hash"):
                     state.files[relpath]["hash"] = new_hash
                     state.files[relpath]["size"] = computer_path.stat().st_size
                     updated += 1
@@ -1691,13 +1754,20 @@ def cmd_reindex(args):
 
         state.save()
 
-        print(f"  Original entries: {original_count}")
-        print(f"  Kept:             {kept}")
+        print(f"  Original entries:   {original_count}")
+        print(f"  Kept:               {kept}")
+        if tombstones_kept:
+            print(f"  Tombstones kept:    {tombstones_kept} "
+                  f"(use --clear-tombstones to remove)")
         if updated:
-            print(f"  Re-hashed:        {updated}")
-        if removed:
-            print(f"  Removed (gone):   {removed}")
-        print(f"  Final entries:    {len(state.files)}")
+            print(f"  Re-hashed:          {updated}")
+        if removed_missing:
+            print(f"  Removed (missing):  {removed_missing} "
+                  f"(will re-download on next sync)")
+        if removed_tombstones:
+            print(f"  Tombstones cleared: {removed_tombstones} "
+                  f"(will re-download on next sync)")
+        print(f"  Final entries:      {len(state.files)}")
 
 
 def cmd_reset_state(args):
@@ -1781,13 +1851,16 @@ def main():
     p_reset.add_argument(
         "-d", "--device", help="Device serial or name (default: all)")
 
-    # reindex
-    p_reindex = subparsers.add_parser(
-        "reindex",
-        help="Rebuild state from files on disk (removes stale entries)")
-    p_reindex.add_argument(
+    # prune-state
+    p_prune = subparsers.add_parser(
+        "prune-state",
+        help="Remove stale state entries (keeps tombstones by default)")
+    p_prune.add_argument(
         "-d", "--device", help="Device serial or name (default: all)")
-    p_reindex.add_argument(
+    p_prune.add_argument(
+        "--clear-tombstones", action="store_true",
+        help="Also remove tombstoned entries (will re-download on next sync)")
+    p_prune.add_argument(
         "--rehash", action="store_true",
         help="Recompute file hashes (slow but thorough)")
 
@@ -1806,8 +1879,8 @@ def main():
         cmd_detect_paths(args)
     elif args.command == "config":
         cmd_config(args)
-    elif args.command == "reindex":
-        cmd_reindex(args)
+    elif args.command == "prune-state":
+        cmd_prune_state(args)
     elif args.command == "reset-state":
         cmd_reset_state(args)
     else:
