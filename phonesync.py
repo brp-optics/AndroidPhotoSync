@@ -498,12 +498,15 @@ class ADB:
                   expected_hash: str = None) -> bool:
         """Move a file on the phone with collision check and hash verification.
 
-        If the destination already exists with the correct content, returns
-        True (the intent is satisfied) WITHOUT deleting the source — it
-        may be an intentional duplicate the user wants to keep.
+        Uses copy-verify-delete instead of mv to avoid corruption:
+          1. Check destination doesn't already exist (or has correct content)
+          2. mkdir -p the destination parent
+          3. cp source to destination
+          4. Verify hash at destination
+          5. Only then rm the source
 
-        Returns True only if the file exists at the destination with the
-        correct content after this call.
+        If the destination already exists with the correct content, returns
+        True WITHOUT deleting the source (it may be an intentional duplicate).
         """
         q = self._q
         # Check if destination already exists
@@ -517,28 +520,43 @@ class ADB:
                     logging.info(
                         f"  Destination already has correct content: "
                         f"{remote_dst}")
-                    # Do NOT delete source — it may be an intentional
-                    # duplicate on the phone
                     return True
             logging.error(
                 f"  Cannot move {remote_src} -> {remote_dst}: "
                 f"destination exists with different content")
             return False
 
-        if not self.move(remote_src, remote_dst):
+        # Copy instead of move
+        parent = os.path.dirname(remote_dst)
+        try:
+            self.shell(f'mkdir -p {q(parent)}')
+            self.shell(f'cp {q(remote_src)} {q(remote_dst)}')
+        except ADBError as e:
+            logging.error(f"  Failed to copy {remote_src} -> {remote_dst}: {e}")
+            # Clean up partial copy
+            self.shell(f'rm -f {q(remote_dst)}', check=False)
             return False
 
-        # Verify hash after move
+        # Verify hash at destination
         if expected_hash:
             actual_hash = self.file_hash(remote_dst)
             if actual_hash != expected_hash:
                 logging.error(
-                    f"  Hash mismatch after phone move! "
+                    f"  Hash mismatch after copy! "
                     f"Expected {expected_hash[:12]}..., "
-                    f"got {actual_hash[:12] if actual_hash else 'None'}...")
-                # Move it back
-                self.move(remote_dst, remote_src)
+                    f"got {actual_hash[:12] if actual_hash else 'None'}... "
+                    f"Removing bad copy, source untouched.")
+                self.shell(f'rm -f {q(remote_dst)}', check=False)
                 return False
+
+        # Copy verified — now safe to remove source
+        try:
+            self.shell(f'rm {q(remote_src)}')
+        except ADBError as e:
+            # Source removal failed, but the copy is good.
+            # This is fine — we have a good copy at the destination.
+            logging.warning(
+                f"  Copy verified but source removal failed: {e}")
 
         return True
 
@@ -689,6 +707,24 @@ def get_photo_date(filepath: str,
                 if 2000 <= y <= 2100 and 1 <= mo <= 12 and 1 <= d <= 31:
                     return datetime(y, mo, d)
             except (ValueError, IndexError):
+                continue
+
+    # Try unix epoch timestamps in filename (common in Kakao exports, etc.)
+    # Match 13-digit ms timestamps first, then 10-digit second timestamps
+    stem = Path(basename).stem
+    epoch_patterns = [
+        (r'(\d{13})', 1000),   # milliseconds (e.g. 1719532800000)
+        (r'(\d{10})', 1),      # seconds (e.g. 1719532800)
+    ]
+    for pattern, divisor in epoch_patterns:
+        m = re.search(pattern, stem)
+        if m:
+            try:
+                epoch = int(m.group(1)) / divisor
+                # Sanity check: between 2000-01-01 and 2100-01-01
+                if 946684800 <= epoch <= 4102444800:
+                    return datetime.fromtimestamp(epoch)
+            except (ValueError, OverflowError, OSError):
                 continue
 
     # Fall back to phone mtime
