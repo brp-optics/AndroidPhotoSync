@@ -280,6 +280,7 @@ class DeviceState:
                 data = json.load(f)
             self.files = data.get("files", {})
             self.last_sync = data.get("last_sync")
+        # Else error and crash quickly? crash safely?
 
     def save(self):
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -367,7 +368,7 @@ class ADB:
     def list_files_recursive(self, remote_dir: str,
                              exclude_dirs: list[str] = None,
                              exclude_files: list[str] = None,
-                             max_depth: int = 10) -> list[dict]:
+                             max_depth: int = 255) -> list[dict]:
         """
         Recursively list files in a directory on the phone.
         Returns list of {name, size, mtime_epoch, path, relpath}.
@@ -495,20 +496,24 @@ class ADB:
             return False
 
     def move_safe(self, remote_src: str, remote_dst: str,
-                  expected_hash: str = None) -> bool:
+                  expected_hash: str = None) -> dict:
         """Move a file on the phone with collision check and hash verification.
 
-        Uses copy-verify-delete instead of mv to avoid corruption:
+        Uses copy-verify-delete instead of mv:
           1. Check destination doesn't already exist (or has correct content)
-          2. mkdir -p the destination parent
-          3. cp source to destination
-          4. Verify hash at destination
-          5. Only then rm the source
+          2. cp source to destination
+          3. Verify hash at destination
+          4. rm source
 
-        If the destination already exists with the correct content, returns
-        True WITHOUT deleting the source (it may be an intentional duplicate).
+        Returns dict with:
+          ok: bool - True if dest has correct content after this call
+          action: str - "moved", "already_there", "collision", "copy_failed",
+                        "hash_mismatch"
+          source_deleted: bool - whether the source was removed
         """
         q = self._q
+        result = {"ok": False, "action": "", "source_deleted": False}
+
         # Check if destination already exists
         check = self.shell(
             f'[ -e {q(remote_dst)} ] && echo EXISTS || echo FREE',
@@ -520,11 +525,23 @@ class ADB:
                     logging.info(
                         f"  Destination already has correct content: "
                         f"{remote_dst}")
-                    return True
+                    # Delete source — we're mirroring a move, the old
+                    # location should go away
+                    try:
+                        self.shell(f'rm {q(remote_src)}')
+                        result["source_deleted"] = True
+                    except ADBError as e:
+                        logging.warning(
+                            f"  Destination correct but source removal "
+                            f"failed: {e}")
+                    result["ok"] = True
+                    result["action"] = "already_there"
+                    return result
             logging.error(
                 f"  Cannot move {remote_src} -> {remote_dst}: "
                 f"destination exists with different content")
-            return False
+            result["action"] = "collision"
+            return result
 
         # Copy instead of move
         parent = os.path.dirname(remote_dst)
@@ -533,9 +550,9 @@ class ADB:
             self.shell(f'cp {q(remote_src)} {q(remote_dst)}')
         except ADBError as e:
             logging.error(f"  Failed to copy {remote_src} -> {remote_dst}: {e}")
-            # Clean up partial copy
             self.shell(f'rm -f {q(remote_dst)}', check=False)
-            return False
+            result["action"] = "copy_failed"
+            return result
 
         # Verify hash at destination
         if expected_hash:
@@ -547,18 +564,20 @@ class ADB:
                     f"got {actual_hash[:12] if actual_hash else 'None'}... "
                     f"Removing bad copy, source untouched.")
                 self.shell(f'rm -f {q(remote_dst)}', check=False)
-                return False
+                result["action"] = "hash_mismatch"
+                return result
 
         # Copy verified — now safe to remove source
         try:
             self.shell(f'rm {q(remote_src)}')
+            result["source_deleted"] = True
         except ADBError as e:
-            # Source removal failed, but the copy is good.
-            # This is fine — we have a good copy at the destination.
             logging.warning(
                 f"  Copy verified but source removal failed: {e}")
 
-        return True
+        result["ok"] = True
+        result["action"] = "moved"
+        return result
 
     def file_exists(self, remote_path: str) -> bool:
         """Check if a file exists on the phone."""
@@ -710,22 +729,24 @@ def get_photo_date(filepath: str,
                 continue
 
     # Try unix epoch timestamps in filename (common in Kakao exports, etc.)
-    # Match 13-digit ms timestamps first, then 10-digit second timestamps
+    # Seconds: 9-10 digits (2000-01-01 = 946684800, 2286 = 9999999999)
+    # Milliseconds: 12-13 digits (2000-01-01 = 946684800000)
+    # Use word boundaries to avoid grabbing substrings of longer numbers
     stem = Path(basename).stem
-    epoch_patterns = [
-        (r'(\d{13})', 1000),   # milliseconds (e.g. 1719532800000)
-        (r'(\d{10})', 1),      # seconds (e.g. 1719532800)
-    ]
-    for pattern, divisor in epoch_patterns:
-        m = re.search(pattern, stem)
-        if m:
-            try:
-                epoch = int(m.group(1)) / divisor
-                # Sanity check: between 2000-01-01 and 2100-01-01
-                if 946684800 <= epoch <= 4102444800:
-                    return datetime.fromtimestamp(epoch)
-            except (ValueError, OverflowError, OSError):
-                continue
+    for m in re.finditer(r'(?<!\d)(\d{12,13})(?!\d)', stem):
+        try:
+            epoch = int(m.group(1)) / 1000  # milliseconds
+            if 946684800 <= epoch <= 4102444800:
+                return datetime.fromtimestamp(epoch)
+        except (ValueError, OverflowError, OSError):
+            continue
+    for m in re.finditer(r'(?<!\d)(\d{9,10})(?!\d)', stem):
+        try:
+            epoch = int(m.group(1))  # seconds
+            if 946684800 <= epoch <= 4102444800:
+                return datetime.fromtimestamp(epoch)
+        except (ValueError, OverflowError, OSError):
+            continue
 
     # Fall back to phone mtime
     if phone_mtime_epoch:
@@ -780,6 +801,7 @@ class SyncEngine:
             "files_skipped": 0,
             "files_updated": 0,     # re-pulled due to mtime change
             "duplicates_kept": 0,
+            "duplicates_skipped": 0,  # keep_duplicates=false re-pulls
             "moves_synced": 0,
             "phone_moves_detected": 0,
             "local_deletions": 0,   # files missing from computer
@@ -986,9 +1008,20 @@ class SyncEngine:
         Uses the shared phone scan to find files whose tracked phone_path
         no longer exists but whose content (by size + hash) is at a new
         path. Updates state so ingest doesn't re-download them.
+
+        Avoids false moves: if a candidate new path is already tracked
+        by another state entry, it's not a move target — it's a separate
+        file that happens to have the same content.
         """
         logging.info("=== Phase 1: Detecting phone-side moves ===")
         sources = self._get_sources()
+
+        # Build set of all phone_paths currently tracked in state,
+        # so we don't "move" to a path that's already someone else's
+        tracked_phone_paths = set()
+        for relpath, info in self.state.files.items():
+            if info.get("device_name") == self.device_name:
+                tracked_phone_paths.add(info["phone_path"])
 
         for relpath, info in list(self.state.files.items()):
             if info.get("device_name") != self.device_name:
@@ -1006,9 +1039,11 @@ class SyncEngine:
             new_phone_path = None
 
             for ppath, pinfo in self._phone_path_index.items():
+                # Skip paths already tracked by another state entry
+                if ppath in tracked_phone_paths and ppath != old_phone_path:
+                    continue
                 if pinfo["size"] != expected_size:
                     continue
-                # Size matches — verify hash on phone
                 phone_hash = self.adb.file_hash(ppath)
                 if phone_hash == file_hash:
                     new_phone_path = ppath
@@ -1019,6 +1054,9 @@ class SyncEngine:
                     f"  Phone-side move detected: "
                     f"{old_phone_path} -> {new_phone_path}")
                 self.state.files[relpath]["phone_path"] = new_phone_path
+                # Update tracked set
+                tracked_phone_paths.discard(old_phone_path)
+                tracked_phone_paths.add(new_phone_path)
                 # Update phone_source_dir if it changed
                 for category, dirs in sources.items():
                     for phone_dir in dirs:
@@ -1028,6 +1066,8 @@ class SyncEngine:
                                 phone_dir
                             break
                 self.stats["phone_moves_detected"] += 1
+            # else: file deleted from phone — that's fine, we keep it on
+            # computer (safe delete behavior)
 
     def _phase_ingest(self):
         """Phase 2: Ingest genuinely new files from phone.
@@ -1118,7 +1158,40 @@ class SyncEngine:
                     self.stats["bytes_copied"] += size
                     continue
                 else:
-                    del self.state.files[existing]
+                    # CONFLICT: file edited on phone AND moved on computer.
+                    # Search for the moved file using the OLD hash.
+                    old_hash = self.state.files[existing].get("hash")
+                    moved_to = None
+                    if old_hash:
+                        moved_to = self._find_file_by_hash(
+                            old_hash, previous_path=old_computer_path)
+                    if moved_to:
+                        logging.info(
+                            f"  Conflict: file moved on computer AND "
+                            f"edited on phone.")
+                        new_relpath = str(
+                            moved_to.relative_to(self.data_dir))
+                        logging.info(
+                            f"    Updating at moved location: "
+                            f"{new_relpath}")
+                        shutil.move(str(tmp_path), str(moved_to))
+                        old_info = self.state.files.pop(existing)
+                        mtime_iso = datetime.fromtimestamp(
+                            finfo["mtime_epoch"]).isoformat()
+                        old_info["hash"] = local_hash
+                        old_info["size"] = size
+                        old_info["phone_mtime"] = mtime_iso
+                        old_info["synced_at"] = datetime.now().isoformat()
+                        self.state.files[new_relpath] = old_info
+                        self.stats["files_updated"] += 1
+                        self.stats["bytes_copied"] += size
+                        continue
+                    else:
+                        logging.warning(
+                            f"  File edited on phone but local copy "
+                            f"missing and not found elsewhere: "
+                            f"{existing}. Treating as new file.")
+                        del self.state.files[existing]
 
             # Check for duplicate by hash
             existing_by_hash = self.state.find_by_hash_and_device(local_hash)
@@ -1126,10 +1199,16 @@ class SyncEngine:
 
             if existing_by_hash and not keep_duplicates:
                 logging.info(f"  Skipping (duplicate by hash): {filename}")
+                logging.debug(
+                    f"    Note: keep_duplicates=false means this file "
+                    f"will be re-pulled and re-hashed every sync. "
+                    f"Consider keep_duplicates=true if you have many "
+                    f"duplicates on the phone.")
                 tmp_path.unlink(missing_ok=True)
                 # Do NOT overwrite the existing entry's phone_path —
                 # that would lose the original phone_path tracking.
                 # The duplicate phone_path simply isn't tracked.
+                self.stats["duplicates_skipped"] += 1
                 self.stats["files_skipped"] += 1
                 continue
             elif existing_by_hash:
@@ -1279,8 +1358,12 @@ class SyncEngine:
                 continue
 
             logging.info(f"  Moving on phone: {old_phone} -> {new_phone}")
-            if self.adb.move_safe(old_phone, new_phone, file_hash):
+            result = self.adb.move_safe(old_phone, new_phone, file_hash)
+            if result["ok"]:
                 self.state.files[relpath]["phone_path"] = new_phone
+                if result["action"] == "already_there":
+                    logging.info(f"    (destination already existed, "
+                                 f"source {'removed' if result['source_deleted'] else 'kept'})")
             else:
                 self.stats["errors"] += 1
 
@@ -1329,6 +1412,9 @@ class SyncEngine:
           3. Parent directories walking upward toward data_dir
           4. Everything else under data_dir
 
+        Tracks resolved real paths to detect symlink cycles, with a
+        configurable max_symlink_depth (default 2).
+
         Args:
             target_hash: SHA256 hash to search for.
             previous_path: The last known full path of the file (used to
@@ -1338,7 +1424,9 @@ class SyncEngine:
         if not self.data_dir.exists():
             return None
 
-        searched = set()  # track searched dirs to avoid re-walking
+        max_symlink_depth = self.cfg.get("max_symlink_depth", 2)
+        searched = set()       # track searched dirs to avoid re-walking
+        resolved_seen = set()  # track resolved paths to detect cycles
 
         def _check_file(fpath: Path) -> bool:
             try:
@@ -1346,11 +1434,25 @@ class SyncEngine:
             except (OSError, IOError):
                 return False
 
+        def _symlink_depth(path: Path) -> int:
+            """Count how many symlink hops are in a path's ancestry."""
+            depth = 0
+            for p in [path] + list(path.parents):
+                if p.is_symlink():
+                    depth += 1
+            return depth
+
         def _scan_dir_only(directory: Path) -> Optional[Path]:
             """Check only immediate files in a directory (non-recursive)."""
             if not directory.is_dir() or str(directory) in searched:
                 return None
+            if _symlink_depth(directory) > max_symlink_depth:
+                return None
+            real = str(directory.resolve())
+            if real in resolved_seen:
+                return None  # cycle
             searched.add(str(directory))
+            resolved_seen.add(real)
             try:
                 for item in directory.iterdir():
                     if item.is_file() and _check_file(item):
@@ -1364,12 +1466,20 @@ class SyncEngine:
             if not directory.is_dir():
                 return None
             for root, dirs, files in os.walk(directory, followlinks=True):
-                dirs[:] = [d for d in dirs if not d.startswith(".")
-                           and str(Path(root) / d) not in searched]
-                if str(root) not in searched:
-                    searched.add(str(root))
+                root_path = Path(root)
+                real_root = str(root_path.resolve())
+                if real_root in resolved_seen and str(root_path) not in searched:
+                    dirs.clear()  # cycle — don't descend
+                    continue
+                if _symlink_depth(root_path) > max_symlink_depth:
+                    dirs.clear()
+                    continue
+                resolved_seen.add(real_root)
+                dirs[:] = [d for d in dirs if not d.startswith(".")]
+                if str(root_path) not in searched:
+                    searched.add(str(root_path))
                     for fname in files:
-                        fpath = Path(root) / fname
+                        fpath = root_path / fname
                         if _check_file(fpath):
                             return fpath
             return None
@@ -1412,6 +1522,14 @@ class SyncEngine:
         if s["duplicates_kept"]:
             print(f"  Duplicates kept:  {s['duplicates_kept']} "
                   f"(same content, different path)")
+        if s["duplicates_skipped"]:
+            print(f"  Duplicates skip:  {s['duplicates_skipped']} "
+                  f"(re-pulled to verify, keep_duplicates=false)")
+            if s["duplicates_skipped"] > 10:
+                print(f"  ⚠ {s['duplicates_skipped']} duplicate files were "
+                      f"pulled and discarded. With keep_duplicates=false, "
+                      f"this happens every sync. Consider "
+                      f"keep_duplicates=true to avoid repeated transfers.")
         if s["phone_moves_detected"]:
             print(f"  Phone moves:      {s['phone_moves_detected']}")
         print(f"  Moves synced:     {s['moves_synced']}")
