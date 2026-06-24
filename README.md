@@ -1,13 +1,13 @@
 # AndroidPhotoSync
-A CLI tool for one-way sync of photos, downloads, and recordings from Android phone(s) to Linux via ADB. Supports two phones merging into one photo library with automatic date-based reverse-syncing of file sorting. Does not sync back file deletes. Requires python, uv, and adb enabled on each device.
+A CLI tool for sync of photos, downloads, and recordings from Android phone(s) to Linux via ADB. Supports two phones merging into one photo library with automatic reverse-syncing of file sorting that happens on Linux. File deletions on computer are not synced in either direction, and deleted files aren't filled in again. Requires python, uv, and adb enabled on each device. Test harness requires pillow and pytest.
 
 ## Features
 
-- **Automatic sync** when phone is plugged in via USB (udev + systemd)
-- **Two phones, one library** — photos merge into date-based folders, deduped by content hash
-- **Smart photo organization** — sorted into `YYYY/MM/` folders using EXIF data or filename dates
-- **Move tracking** — sort photos into subfolders on your computer, and the moves propagate to your phone
-- **Safe deletes** — deleting from phone doesn't remove from computer
+- **Automatic sync** when phone is plugged in via USB (via udev + systemd)
+- **Multiple phones, one library** — photos merge into date-based folders, deduped by content hash
+- **Smart photo organization** — sorted into `YYYY/MM` folders initially using EXIF data or filename dates
+- **Move tracking** — sort photos into subfolders on your computer, and the moves propagate to your phone(s)
+- **Safe deletes** — deleting from phone(s) doesn't remove from computer; deleting from computer doesn't remove from phones.
 - **Collision handling** — files with the same name but different content get device-suffixed names
 - **Dry run mode** — preview what would happen without changing anything
 
