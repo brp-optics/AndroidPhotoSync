@@ -1041,18 +1041,48 @@ class SyncEngine:
             if info.get("device_name") != self.device_name:
                 continue
             old_phone_path = info["phone_path"]
-
-            # Is the file still at its expected phone location?
-            if old_phone_path in self._phone_path_index:
-                continue
-
-            # File is gone from expected phone path.
-            # Search for it at a new path by size + hash.
             file_hash = info["hash"]
             expected_size = info.get("size", -1)
+
+            # Is the file still at its expected phone location?
+            # It counts as "still there" only if the CONTENT at that path
+            # still matches what we tracked. If a different file now
+            # occupies the old path (same path, different content), our
+            # tracked file has moved away and must be searched for by hash.
+            if old_phone_path in self._phone_path_index:
+                occupant = self._phone_path_index[old_phone_path]
+                if occupant["size"] != expected_size:
+                    # Size differs — a different file occupies the old
+                    # path; fall through to search for ours by hash.
+                    pass
+                else:
+                    # Size matches. Use mtime as a cheap proxy to avoid
+                    # hashing unchanged files: if size AND mtime match the
+                    # tracked values, the content is almost certainly the
+                    # same, so it's not a move.
+                    tracked_mtime = info.get("phone_mtime", "")
+                    occupant_mtime = datetime.fromtimestamp(
+                        occupant["mtime_epoch"]).isoformat()
+                    if tracked_mtime and tracked_mtime == occupant_mtime:
+                        continue
+                    # mtime differs (or unknown): hash to disambiguate
+                    # "same file touched" from "different file at old path".
+                    occupant_hash = self.adb.file_hash(old_phone_path)
+                    if occupant_hash == file_hash:
+                        # Same content still at old path — not a move.
+                        continue
+                    # else: different content at old path — fall through
+                    # and search for our file elsewhere by hash.
+
+            # File is gone from (or displaced at) its expected phone path.
+            # Search for it at a new path by size + hash.
             new_phone_path = None
 
             for ppath, pinfo in self._phone_path_index.items():
+                # The old path can't be the move target if a different
+                # file now occupies it.
+                if ppath == old_phone_path:
+                    continue
                 # Skip paths already tracked by another state entry
                 if ppath in tracked_phone_paths and ppath != old_phone_path:
                     continue
