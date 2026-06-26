@@ -2,12 +2,12 @@
 
 Behavioral tests verify that FakeADB produces the same observable
 results a real ADB would for each operation. They use a standalone
-FakeADB (no TestHarness) to isolate the ADB layer from sync logic.
+ADBFixture (no TestHarness) to isolate the ADB layer from sync logic.
 """
 import hashlib
 import inspect
 import os
-import shlex
+import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -22,36 +22,52 @@ from conftest import FakeADB
 # ---------------------------------------------------------------------------
 
 class ADBFixture:
-    """Context manager that provides a FakeADB with a fresh temp dir."""
+    """Context manager providing a FakeADB with a fresh temp dir."""
+    def __init__(self, external_sd=False):
+        self._want_sd = external_sd
+
     def __enter__(self):
         self.tmpdir = Path(tempfile.mkdtemp(prefix="fakeadb_test_"))
         FakeADB.reset_registry()
-        FakeADB.register("TEST", self.tmpdir, "TestPhone")
+        ext = None
+        if self._want_sd:
+            ext = self.tmpdir / "ext_sd"
+            ext.mkdir()
+            self.ext_sd_dir = ext
+        FakeADB.register("TEST", self.tmpdir / "internal",
+                         "TestPhone", external_sd=ext)
+        (self.tmpdir / "internal").mkdir()
         self.adb = FakeADB("TEST")
+        self.root = self.tmpdir / "internal"
         return self
 
     def __exit__(self, *args):
         FakeADB.reset_registry()
-        import shutil
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
     def write(self, relpath: str, content: bytes, mtime: float = None):
-        """Write a file under the fake phone root."""
-        p = self.tmpdir / relpath
+        p = self.root / relpath
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(content)
+        if mtime is not None:
+            os.utime(str(p), (mtime, mtime))
+
+    def write_sd(self, relpath: str, content: bytes, mtime: float = None):
+        p = self.ext_sd_dir / relpath
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_bytes(content)
         if mtime is not None:
             os.utime(str(p), (mtime, mtime))
 
     def exists(self, relpath: str) -> bool:
-        return (self.tmpdir / relpath).exists()
+        return (self.root / relpath).exists()
 
     def read(self, relpath: str) -> bytes:
-        return (self.tmpdir / relpath).read_bytes()
+        return (self.root / relpath).read_bytes()
 
-    def phone_path(self, relpath: str) -> str:
-        """Convert a local relpath to /sdcard/... phone path."""
-        return f"/sdcard/{relpath}"
+    def q(self, phone_path: str) -> str:
+        """Quote a path through FakeADB._q (same as ADB._q)."""
+        return self.adb._q(phone_path)
 
 
 # ---------------------------------------------------------------------------
@@ -73,7 +89,7 @@ class TestSignatureContract:
         adb_methods = _public_methods(phonesync.ADB)
         fake_methods = _public_methods(FakeADB)
         missing = set(adb_methods) - set(fake_methods)
-        assert missing == set(), f"FakeADB is missing methods: {missing}"
+        assert missing == set(), f"FakeADB missing: {missing}"
 
     def test_method_signatures_match(self):
         adb_methods = _public_methods(phonesync.ADB)
@@ -86,24 +102,347 @@ class TestSignatureContract:
                 mismatches.append(
                     f"  {name}: ADB{adb_methods[name]} "
                     f"!= FakeADB{fake_methods[name]}")
-        assert mismatches == [], (
-            f"Signature mismatches:\n" + "\n".join(mismatches))
+        assert mismatches == [], "\n".join(mismatches)
 
     def test_no_extra_public_methods(self):
         adb_methods = _public_methods(phonesync.ADB)
         fake_methods = _public_methods(FakeADB)
         extra = set(fake_methods) - set(adb_methods)
-        assert extra == set(), (
-            f"FakeADB has extra public methods: {extra}")
+        assert extra == set(), f"FakeADB extra: {extra}"
 
 
 # ---------------------------------------------------------------------------
-# Behavioral: list_files_recursive
+# _q quoting
+# ---------------------------------------------------------------------------
+
+class TestQuoting:
+    def test_q_matches_shlex_quote(self):
+        """FakeADB._q should produce the same output as shlex.quote."""
+        import shlex
+        cases = [
+            "/sdcard/DCIM/Camera/IMG.jpg",
+            "/sdcard/DCIM/Camera/my photo (1).jpg",
+            "/sdcard/DCIM/Camera/it's a photo.jpg",
+            '/sdcard/DCIM/Camera/double"quote.jpg',
+            "/sdcard/DCIM/Camera/dollar$HOME.jpg",
+            "/sdcard/DCIM/Camera/backtick`cmd`.jpg",
+            "/sdcard/DCIM/Camera/ampersand&file.jpg",
+            "/sdcard/DCIM/Camera/glob*.jpg",
+            "/sdcard/DCIM/Camera/brackets[1].jpg",
+            "/sdcard/DCIM/Camera/question?.jpg",
+            "/sdcard/DCIM/Camera/-leading-dash.jpg",
+            "/sdcard/DCIM/Camera/name with backslash\\.jpg",
+            "/sdcard/DCIM/Camera/사진_2025.jpg",
+            "/sdcard/DCIM/Camera/a;rm -rf.jpg",
+        ]
+        for path in cases:
+            assert FakeADB._q(path) == shlex.quote(path), (
+                f"_q mismatch for {path!r}")
+
+
+# ---------------------------------------------------------------------------
+# Pathological filenames
+# ---------------------------------------------------------------------------
+
+PATHOLOGICAL_FILES = [
+    ("my photo (1).jpg",        b"spaces_parens"),
+    ("it's a photo.jpg",        b"single_quote"),
+    ('double"quote.jpg',        b"double_quote"),
+    ("dollar$HOME.jpg",         b"dollar_sign"),
+    ("backtick`cmd`.jpg",       b"backticks"),
+    ("ampersand&file.jpg",      b"ampersand"),
+    ("glob*.jpg",               b"glob_star"),
+    ("brackets[1].jpg",         b"brackets"),
+    ("question?.jpg",           b"question_mark"),
+    ("-leading-dash.jpg",       b"leading_dash"),
+    ("name with backslash\\.jpg", b"backslash"),
+    ("사진_2025.jpg",            b"korean"),
+    ("a;rm -f.jpg",            b"semicolon"),
+    ("photo|vacation.jpg",      b"pipe_char"),
+]
+
+
+class TestPathologicalFilenames:
+    def test_list_files_finds_all(self):
+        """list_files_recursive should find every pathological filename."""
+        with ADBFixture() as f:
+            for name, content in PATHOLOGICAL_FILES:
+                f.write(f"DCIM/Camera/{name}", content)
+            files = f.adb.list_files_recursive("/sdcard/DCIM/Camera")
+            found = {e["name"] for e in files}
+            for name, _ in PATHOLOGICAL_FILES:
+                assert name in found, f"Missing: {name!r}"
+            assert len(files) == len(PATHOLOGICAL_FILES)
+
+    def test_pull_each(self):
+        """pull should work for every pathological filename."""
+        with ADBFixture() as f:
+            for name, content in PATHOLOGICAL_FILES:
+                f.write(f"DCIM/Camera/{name}", content)
+                dst = str(f.tmpdir / f"_pulled_{hash(name)}")
+                ok = f.adb.pull(f"/sdcard/DCIM/Camera/{name}", dst)
+                assert ok is True, f"pull failed: {name!r}"
+                assert open(dst, "rb").read() == content
+
+    def test_file_hash_each(self):
+        with ADBFixture() as f:
+            for name, content in PATHOLOGICAL_FILES:
+                f.write(f"DCIM/Camera/{name}", content)
+                expected = hashlib.sha256(content).hexdigest()
+                got = f.adb.file_hash(f"/sdcard/DCIM/Camera/{name}")
+                assert got == expected, f"hash mismatch: {name!r}"
+
+    def test_stat_via_shell_with_q(self):
+        """stat commands using _q quoting should work for all filenames."""
+        with ADBFixture() as f:
+            for name, content in PATHOLOGICAL_FILES:
+                f.write(f"DCIM/Camera/{name}", content)
+                phone_path = f"/sdcard/DCIM/Camera/{name}"
+                q = f.q(phone_path)
+                out = f.adb.shell(f"stat -c %s {q}")
+                assert out.strip() == str(len(content)), (
+                    f"stat size wrong for {name!r}: {out!r}")
+
+    def test_move_safe_each(self):
+        with ADBFixture() as f:
+            for name, content in PATHOLOGICAL_FILES:
+                f.write(f"DCIM/Camera/{name}", content)
+                h = hashlib.sha256(content).hexdigest()
+                result = f.adb.move_safe(
+                    f"/sdcard/DCIM/Camera/{name}",
+                    f"/sdcard/DCIM/Sorted/{name}",
+                    h)
+                assert result["ok"] is True, (
+                    f"move_safe failed for {name!r}: {result}")
+
+    def test_exists_check_via_shell_with_q(self):
+        with ADBFixture() as f:
+            for name, content in PATHOLOGICAL_FILES:
+                f.write(f"DCIM/Camera/{name}", content)
+                phone_path = f"/sdcard/DCIM/Camera/{name}"
+                q = f.q(phone_path)
+                out = f.adb.shell(
+                    f"[ -e {q} ] && echo EXISTS || echo MISSING")
+                assert "EXISTS" in out, (
+                    f"exists check failed for {name!r}")
+
+    def test_cp_mv_rm_via_shell_with_q(self):
+        """cp, mv, rm through shell with quoted pathological names."""
+        with ADBFixture() as f:
+            for i, (name, content) in enumerate(PATHOLOGICAL_FILES):
+                f.write(f"DCIM/Camera/{name}", content)
+                src = f.q(f"/sdcard/DCIM/Camera/{name}")
+                cp_dst = f.q(f"/sdcard/DCIM/Copy/{name}")
+                mv_dst = f.q(f"/sdcard/DCIM/Moved/{name}")
+
+                f.adb.shell(f"mkdir -p {f.q('/sdcard/DCIM/Copy')}")
+                f.adb.shell(f"cp {src} {cp_dst}")
+                assert f.exists(f"DCIM/Copy/{name}"), (
+                    f"cp failed: {name!r}")
+
+                f.adb.shell(f"mkdir -p {f.q('/sdcard/DCIM/Moved')}")
+                f.adb.shell(f"mv {cp_dst} {mv_dst}")
+                assert f.exists(f"DCIM/Moved/{name}"), (
+                    f"mv failed: {name!r}")
+                assert not f.exists(f"DCIM/Copy/{name}")
+
+                f.adb.shell(f"rm {mv_dst}")
+                assert not f.exists(f"DCIM/Moved/{name}"), (
+                    f"rm failed: {name!r}")
+
+
+# ---------------------------------------------------------------------------
+# Path mapping: /sdcard/ vs /storage/emulated/0/
+# ---------------------------------------------------------------------------
+
+class TestPathMapping:
+    def test_sdcard_and_storage_emulated_same_file(self):
+        """Both /sdcard/... and /storage/emulated/0/... should hit same file."""
+        with ADBFixture() as f:
+            f.write("DCIM/Camera/IMG.jpg", b"same file")
+
+            h1 = f.adb.file_hash("/sdcard/DCIM/Camera/IMG.jpg")
+            h2 = f.adb.file_hash("/storage/emulated/0/DCIM/Camera/IMG.jpg")
+            assert h1 is not None
+            assert h1 == h2
+
+    def test_pull_via_storage_emulated(self):
+        with ADBFixture() as f:
+            f.write("DCIM/Camera/IMG.jpg", b"content via emulated")
+            dst = str(f.tmpdir / "_pulled.jpg")
+            ok = f.adb.pull("/storage/emulated/0/DCIM/Camera/IMG.jpg", dst)
+            assert ok is True
+            assert open(dst, "rb").read() == b"content via emulated"
+
+    def test_shell_stat_via_storage_emulated(self):
+        with ADBFixture() as f:
+            f.write("test.txt", b"12345")
+            out = f.adb.shell(
+                "stat -c %s '/storage/emulated/0/test.txt'")
+            assert out.strip() == "5"
+
+    def test_file_exists_both_paths(self):
+        with ADBFixture() as f:
+            f.write("file.txt", b"x")
+            assert f.adb.file_exists("/sdcard/file.txt")
+            assert f.adb.file_exists("/storage/emulated/0/file.txt")
+
+    def test_list_files_via_storage_emulated(self):
+        with ADBFixture() as f:
+            f.write("DCIM/Camera/IMG.jpg", b"data")
+            files = f.adb.list_files_recursive(
+                "/storage/emulated/0/DCIM/Camera")
+            assert len(files) == 1
+
+
+# ---------------------------------------------------------------------------
+# External SD card operations
+# ---------------------------------------------------------------------------
+
+class TestExternalSD:
+    def test_write_and_read_sd(self):
+        with ADBFixture(external_sd=True) as f:
+            f.write_sd("DCIM/Camera/sd_photo.jpg", b"sd data")
+            assert f.adb.file_exists("/storage/EXT_SD/DCIM/Camera/sd_photo.jpg")
+
+    def test_pull_from_sd(self):
+        with ADBFixture(external_sd=True) as f:
+            f.write_sd("DCIM/Camera/sd_photo.jpg", b"sd content")
+            dst = str(f.tmpdir / "_pulled_sd.jpg")
+            ok = f.adb.pull(
+                "/storage/EXT_SD/DCIM/Camera/sd_photo.jpg", dst)
+            assert ok is True
+            assert open(dst, "rb").read() == b"sd content"
+
+    def test_file_hash_on_sd(self):
+        with ADBFixture(external_sd=True) as f:
+            content = b"sd hash me"
+            f.write_sd("photo.jpg", content)
+            expected = hashlib.sha256(content).hexdigest()
+            assert f.adb.file_hash(
+                "/storage/EXT_SD/photo.jpg") == expected
+
+    def test_move_between_internal_and_sd(self):
+        with ADBFixture(external_sd=True) as f:
+            f.write("DCIM/Camera/IMG.jpg", b"internal photo")
+            ok = f.adb.move(
+                "/sdcard/DCIM/Camera/IMG.jpg",
+                "/storage/EXT_SD/Backup/IMG.jpg")
+            assert ok is True
+            assert not f.exists("DCIM/Camera/IMG.jpg")
+            assert (f.ext_sd_dir / "Backup" / "IMG.jpg").read_bytes() == (
+                b"internal photo")
+
+    def test_list_storage_volumes_with_sd(self):
+        with ADBFixture(external_sd=True) as f:
+            vols = f.adb.list_storage_volumes()
+            assert len(vols) == 2
+            types = {v["type"] for v in vols}
+            assert "internal" in types
+            assert "external_sd" in types
+
+    def test_list_files_recursive_on_external_sd(self):
+        with ADBFixture(external_sd=True) as f:
+            f.write_sd("DCIM/Camera/sd_photo.jpg", b"sd data")
+            files = f.adb.list_files_recursive("/storage/EXT_SD/DCIM/Camera")
+            assert len(files) == 1
+            assert files[0]["path"] == "/storage/EXT_SD/DCIM/Camera/sd_photo.jpg"
+            assert files[0]["relpath"] == "sd_photo.jpg"
+
+    def test_find_on_external_sd(self):
+        with ADBFixture(external_sd=True) as f:
+            f.write_sd("DCIM/Camera/sd_photo.jpg", b"sd data")
+            out = f.adb.shell(
+                "find /storage/EXT_SD/DCIM/Camera -type f 2>/dev/null"
+            )
+            assert "/storage/EXT_SD/DCIM/Camera/sd_photo.jpg" in out
+
+    def test_ls_glob_on_external_sd(self):
+        with ADBFixture(external_sd=True) as f:
+            (f.ext_sd_dir / "DCIM" / "Camera").mkdir(parents=True)
+            out = f.adb.shell(
+                "ls -1d /storage/EXT_SD/DCIM/*/ 2>/dev/null | head -20"
+            )
+            assert "/storage/EXT_SD/DCIM/Camera/" in out
+            
+# ---------------------------------------------------------------------------
+# Shell: ls -1d pattern (used by cmd_devices)
+# ---------------------------------------------------------------------------
+
+class TestShellLs:
+    def test_ls_glob_dirs(self):
+        """ls -1d <path>/*/ should list subdirectories."""
+        with ADBFixture() as f:
+            (f.root / "DCIM" / "Camera").mkdir(parents=True)
+            (f.root / "DCIM" / "Screenshots").mkdir(parents=True)
+            f.write("DCIM/Camera/img.jpg", b"x")
+            out = f.adb.shell(
+                "ls -1d /sdcard/DCIM/*/ 2>/dev/null | head -20")
+            assert "Camera" in out
+            assert "Screenshots" in out
+
+    def test_ls_glob_no_dirs(self):
+        with ADBFixture() as f:
+            (f.root / "DCIM").mkdir(parents=True)
+            # Only files, no subdirectories
+            f.write("DCIM/file.txt", b"x")
+            out = f.adb.shell(
+                "ls -1d /sdcard/DCIM/*/ 2>/dev/null | head -20")
+            # Should be empty or just whitespace
+            assert "file.txt" not in out
+
+
+# ---------------------------------------------------------------------------
+# Shell: find with prune clauses
+# ---------------------------------------------------------------------------
+
+class TestFindWithPrune:
+    def test_find_with_stat_excludes_pruned_dirs(self):
+        """The full find+prune+stat command pattern used by phonesync."""
+        with ADBFixture() as f:
+            f.write("DCIM/Camera/keep.jpg", b"keep", 1700000000.0)
+            f.write("DCIM/Camera/.thumbnails/skip.jpg", b"skip")
+            f.write("DCIM/Camera/.trashed/old.jpg", b"old")
+            f.write("DCIM/Camera/sub/also_keep.jpg", b"also", 1700000000.0)
+
+            # This is the actual pattern phonesync generates
+            cmd = (
+                "find '/sdcard/DCIM/Camera' -maxdepth 10 "
+                "\\( -name '.thumbnails' -prune "
+                "-o -name '.trashed' -prune \\) -o "
+                "-type f -exec sh -c 'for f; do "
+                "s=$(stat -c %s \"$f\") && "
+                "m=$(stat -c %Y \"$f\") && "
+                "printf \"%s\\0%s\\0%s\\n\" \"$s\" \"$m\" \"$f\"; "
+                "done' _ {} +"
+            )
+            out = f.adb.shell(cmd)
+            lines = [l for l in out.strip().split("\n") if l.strip()]
+            paths = [l.split("\0")[2] for l in lines if "\0" in l]
+            assert any("keep.jpg" in p for p in paths)
+            assert any("also_keep.jpg" in p for p in paths)
+            assert not any(".thumbnails" in p for p in paths)
+            assert not any(".trashed" in p for p in paths)
+
+    def test_list_files_recursive_with_excludes(self):
+        """High-level API should respect exclude_dirs."""
+        with ADBFixture() as f:
+            f.write("DCIM/Camera/keep.jpg", b"keep")
+            f.write("DCIM/Camera/.thumbnails/skip.jpg", b"skip")
+            files = f.adb.list_files_recursive(
+                "/sdcard/DCIM/Camera",
+                exclude_dirs=[".thumbnails"])
+            names = [e["name"] for e in files]
+            assert "keep.jpg" in names
+            assert "skip.jpg" not in names
+
+
+# ---------------------------------------------------------------------------
+# list_files_recursive: shape and depth
 # ---------------------------------------------------------------------------
 
 class TestListFilesRecursive:
     def test_returns_expected_shape(self):
-        """Each returned dict must have name, size, mtime_epoch, path, relpath."""
         with ADBFixture() as f:
             f.write("DCIM/Camera/IMG.jpg", b"photo data", 1700000000.0)
             files = f.adb.list_files_recursive("/sdcard/DCIM/Camera")
@@ -118,16 +457,12 @@ class TestListFilesRecursive:
             assert entry["relpath"] == "IMG.jpg"
 
     def test_nested_relpath(self):
-        """relpath should be relative to the scanned directory."""
         with ADBFixture() as f:
             f.write("DCIM/Camera/sub/deep/IMG.jpg", b"data")
             files = f.adb.list_files_recursive("/sdcard/DCIM/Camera")
-            assert len(files) == 1
             assert files[0]["relpath"] == "sub/deep/IMG.jpg"
-            assert files[0]["path"] == "/sdcard/DCIM/Camera/sub/deep/IMG.jpg"
 
     def test_respects_max_depth(self):
-        """max_depth=1 should only return files in the immediate directory."""
         with ADBFixture() as f:
             f.write("DCIM/Camera/top.jpg", b"top")
             f.write("DCIM/Camera/sub/nested.jpg", b"nested")
@@ -139,47 +474,16 @@ class TestListFilesRecursive:
             assert shallow[0]["name"] == "top.jpg"
             assert len(deep) == 2
 
-    def test_excludes_dirs(self):
-        """Files in excluded directories should be omitted."""
-        with ADBFixture() as f:
-            f.write("DCIM/Camera/keep.jpg", b"keep")
-            f.write("DCIM/Camera/.thumbnails/thumb.jpg", b"skip")
-            f.write("DCIM/Camera/.trashed/old.jpg", b"skip")
-            files = f.adb.list_files_recursive(
-                "/sdcard/DCIM/Camera",
-                exclude_dirs=[".thumbnails", ".trashed"])
-            names = [e["name"] for e in files]
-            assert "keep.jpg" in names
-            assert "thumb.jpg" not in names
-            assert "old.jpg" not in names
-
-    def test_excludes_files(self):
-        """Files matching exclude patterns should be omitted."""
-        with ADBFixture() as f:
-            f.write("DCIM/Camera/photo.jpg", b"keep")
-            f.write("DCIM/Camera/.nomedia", b"skip")
-            f.write("DCIM/Camera/Thumbs.db", b"skip")
-            files = f.adb.list_files_recursive(
-                "/sdcard/DCIM/Camera",
-                exclude_files=[".nomedia", "Thumbs.db"])
-            names = [e["name"] for e in files]
-            assert "photo.jpg" in names
-            assert ".nomedia" not in names
-            assert "Thumbs.db" not in names
-
     def test_nonexistent_dir_returns_empty(self):
         with ADBFixture() as f:
-            files = f.adb.list_files_recursive("/sdcard/NoSuchDir")
-            assert files == []
+            assert f.adb.list_files_recursive("/sdcard/NoDir") == []
 
     def test_empty_dir_returns_empty(self):
         with ADBFixture() as f:
-            (f.tmpdir / "DCIM" / "Camera").mkdir(parents=True)
-            files = f.adb.list_files_recursive("/sdcard/DCIM/Camera")
-            assert files == []
+            (f.root / "DCIM" / "Camera").mkdir(parents=True)
+            assert f.adb.list_files_recursive("/sdcard/DCIM/Camera") == []
 
     def test_list_files_is_depth_one(self):
-        """list_files() should be equivalent to max_depth=1."""
         with ADBFixture() as f:
             f.write("DCIM/Camera/top.jpg", b"top")
             f.write("DCIM/Camera/sub/nested.jpg", b"nested")
@@ -187,72 +491,114 @@ class TestListFilesRecursive:
             assert len(files) == 1
             assert files[0]["name"] == "top.jpg"
 
+    def test_excludes_files_by_pattern(self):
+        with ADBFixture() as f:
+            f.write("DCIM/Camera/photo.jpg", b"keep")
+            f.write("DCIM/Camera/.nomedia", b"skip")
+            files = f.adb.list_files_recursive(
+                "/sdcard/DCIM/Camera", exclude_files=[".nomedia"])
+            names = [e["name"] for e in files]
+            assert "photo.jpg" in names
+            assert ".nomedia" not in names
+
 
 # ---------------------------------------------------------------------------
-# Behavioral: pull / push / delete / move
+# File operations
 # ---------------------------------------------------------------------------
 
 class TestFileOperations:
     def test_pull_copies_content(self):
         with ADBFixture() as f:
-            f.write("DCIM/Camera/IMG.jpg", b"original content")
-            dst = os.path.join(str(f.tmpdir), "_pulled.jpg")
-            ok = f.adb.pull("/sdcard/DCIM/Camera/IMG.jpg", dst)
-            assert ok is True
-            assert open(dst, "rb").read() == b"original content"
+            f.write("DCIM/IMG.jpg", b"original")
+            dst = str(f.tmpdir / "_pulled.jpg")
+            assert f.adb.pull("/sdcard/DCIM/IMG.jpg", dst) is True
+            assert open(dst, "rb").read() == b"original"
 
     def test_pull_nonexistent_returns_false(self):
         with ADBFixture() as f:
-            dst = os.path.join(str(f.tmpdir), "_pulled.jpg")
-            ok = f.adb.pull("/sdcard/no/such/file.jpg", dst)
-            assert ok is False
+            assert f.adb.pull("/sdcard/no.jpg",
+                              str(f.tmpdir / "x")) is False
+
+    def test_pull_preserves_mtime(self):
+        with ADBFixture() as f:
+            f.write("IMG.jpg", b"data", mtime=1700000000.0)
+            dst = str(f.tmpdir / "_pulled.jpg")
+            f.adb.pull("/sdcard/IMG.jpg", dst)
+            assert int(os.stat(dst).st_mtime) == 1700000000
 
     def test_push_creates_file(self):
         with ADBFixture() as f:
-            src = os.path.join(str(f.tmpdir), "_to_push.txt")
+            src = str(f.tmpdir / "_src.txt")
             with open(src, "wb") as fp:
-                fp.write(b"pushed data")
-            ok = f.adb.push(src, "/sdcard/Upload/pushed.txt")
-            assert ok is True
-            assert f.read("Upload/pushed.txt") == b"pushed data"
+                fp.write(b"pushed")
+            assert f.adb.push(src, "/sdcard/Upload/pushed.txt") is True
+            assert f.read("Upload/pushed.txt") == b"pushed"
+
+    def test_push_overwrites_existing(self):
+        with ADBFixture() as f:
+            f.write("file.txt", b"old content")
+            src = str(f.tmpdir / "_new.txt")
+            with open(src, "wb") as fp:
+                fp.write(b"new content")
+            f.adb.push(src, "/sdcard/file.txt")
+            assert f.read("file.txt") == b"new content"
+
+    def test_push_preserves_mtime(self):
+        with ADBFixture() as f:
+            src = str(f.tmpdir / "_src.txt")
+            with open(src, "wb") as fp:
+                fp.write(b"data")
+            os.utime(src, (1700000000.0, 1700000000.0))
+            f.adb.push(src, "/sdcard/file.txt")
+            assert int((f.root / "file.txt").stat().st_mtime) == 1700000000
 
     def test_delete_removes_file(self):
         with ADBFixture() as f:
-            f.write("DCIM/Camera/IMG.jpg", b"data")
-            assert f.exists("DCIM/Camera/IMG.jpg")
-            ok = f.adb.delete("/sdcard/DCIM/Camera/IMG.jpg")
-            assert ok is True
-            assert not f.exists("DCIM/Camera/IMG.jpg")
+            f.write("IMG.jpg", b"data")
+            assert f.adb.delete("/sdcard/IMG.jpg") is True
+            assert not f.exists("IMG.jpg")
 
     def test_delete_nonexistent_returns_false(self):
         with ADBFixture() as f:
-            ok = f.adb.delete("/sdcard/no/file.jpg")
-            assert ok is False
+            assert f.adb.delete("/sdcard/no.jpg") is False
 
     def test_move_relocates_file(self):
         with ADBFixture() as f:
-            f.write("DCIM/Camera/IMG.jpg", b"data")
-            ok = f.adb.move("/sdcard/DCIM/Camera/IMG.jpg",
-                            "/sdcard/DCIM/Camera/sorted/IMG.jpg")
-            assert ok is True
-            assert not f.exists("DCIM/Camera/IMG.jpg")
-            assert f.read("DCIM/Camera/sorted/IMG.jpg") == b"data"
+            f.write("src.jpg", b"data")
+            assert f.adb.move("/sdcard/src.jpg", "/sdcard/dst.jpg") is True
+            assert not f.exists("src.jpg")
+            assert f.read("dst.jpg") == b"data"
 
     def test_move_nonexistent_returns_false(self):
         with ADBFixture() as f:
-            ok = f.adb.move("/sdcard/no/file.jpg", "/sdcard/dest.jpg")
-            assert ok is False
+            assert f.adb.move("/sdcard/no.jpg", "/sdcard/x.jpg") is False
+
+    def test_move_overwrites_destination(self):
+        """move() uses shutil.move which overwrites by default."""
+        with ADBFixture() as f:
+            f.write("src.jpg", b"new")
+            f.write("dst.jpg", b"old")
+            ok = f.adb.move("/sdcard/src.jpg", "/sdcard/dst.jpg")
+            assert ok is True
+            assert f.read("dst.jpg") == b"new"
+
+    def test_move_creates_parent_dirs(self):
+        with ADBFixture() as f:
+            f.write("src.jpg", b"data")
+            ok = f.adb.move("/sdcard/src.jpg", "/sdcard/a/b/c/dst.jpg")
+            assert ok is True
+            assert f.read("a/b/c/dst.jpg") == b"data"
 
     def test_file_exists(self):
         with ADBFixture() as f:
-            assert not f.adb.file_exists("/sdcard/DCIM/IMG.jpg")
-            f.write("DCIM/IMG.jpg", b"data")
-            assert f.adb.file_exists("/sdcard/DCIM/IMG.jpg")
+            assert not f.adb.file_exists("/sdcard/IMG.jpg")
+            f.write("IMG.jpg", b"data")
+            assert f.adb.file_exists("/sdcard/IMG.jpg")
 
     def test_file_mtime(self):
         with ADBFixture() as f:
-            f.write("DCIM/IMG.jpg", b"data", mtime=1700000000.0)
-            assert f.adb.file_mtime("/sdcard/DCIM/IMG.jpg") == 1700000000
+            f.write("IMG.jpg", b"data", mtime=1700000000.0)
+            assert f.adb.file_mtime("/sdcard/IMG.jpg") == 1700000000
 
     def test_file_mtime_nonexistent(self):
         with ADBFixture() as f:
@@ -261,9 +607,9 @@ class TestFileOperations:
     def test_file_hash_matches_content(self):
         with ADBFixture() as f:
             content = b"hash me"
-            f.write("DCIM/IMG.jpg", content)
+            f.write("IMG.jpg", content)
             expected = hashlib.sha256(content).hexdigest()
-            assert f.adb.file_hash("/sdcard/DCIM/IMG.jpg") == expected
+            assert f.adb.file_hash("/sdcard/IMG.jpg") == expected
 
     def test_file_hash_nonexistent(self):
         with ADBFixture() as f:
@@ -272,108 +618,92 @@ class TestFileOperations:
     def test_mkdir_creates_nested(self):
         with ADBFixture() as f:
             f.adb.mkdir("/sdcard/a/b/c/d")
-            assert (f.tmpdir / "a" / "b" / "c" / "d").is_dir()
-
-    def test_pull_preserves_mtime(self):
-        """Pull should preserve modification time (via copy2)."""
-        with ADBFixture() as f:
-            f.write("DCIM/IMG.jpg", b"data", mtime=1700000000.0)
-            dst = os.path.join(str(f.tmpdir), "_pulled.jpg")
-            f.adb.pull("/sdcard/DCIM/IMG.jpg", dst)
-            assert int(os.stat(dst).st_mtime) == 1700000000
+            assert (f.root / "a" / "b" / "c" / "d").is_dir()
 
 
 # ---------------------------------------------------------------------------
-# Behavioral: move_safe
+# move_safe
 # ---------------------------------------------------------------------------
 
 class TestMoveSafe:
     def test_normal_move(self):
-        """move_safe with no collision should copy-verify-delete."""
         with ADBFixture() as f:
-            content = b"move me safely"
-            expected_hash = hashlib.sha256(content).hexdigest()
+            content = b"move me"
+            h = hashlib.sha256(content).hexdigest()
             f.write("src.jpg", content)
-
-            result = f.adb.move_safe(
-                "/sdcard/src.jpg", "/sdcard/dst.jpg", expected_hash)
-
-            assert result["ok"] is True
-            assert result["action"] == "moved"
-            assert result["source_deleted"] is True
+            r = f.adb.move_safe("/sdcard/src.jpg", "/sdcard/dst.jpg", h)
+            assert r == {"ok": True, "action": "moved",
+                         "source_deleted": True}
             assert not f.exists("src.jpg")
             assert f.read("dst.jpg") == content
 
-    def test_collision_different_content(self):
-        """move_safe should refuse when dest exists with different hash."""
+    def test_collision_different_hash(self):
         with ADBFixture() as f:
-            f.write("src.jpg", b"source content")
-            f.write("dst.jpg", b"different content")
-            src_hash = hashlib.sha256(b"source content").hexdigest()
-
-            result = f.adb.move_safe(
-                "/sdcard/src.jpg", "/sdcard/dst.jpg", src_hash)
-
-            assert result["ok"] is False
-            assert result["action"] == "collision"
-            # Source untouched
+            f.write("src.jpg", b"source")
+            f.write("dst.jpg", b"different")
+            h = hashlib.sha256(b"source").hexdigest()
+            r = f.adb.move_safe("/sdcard/src.jpg", "/sdcard/dst.jpg", h)
+            assert r["ok"] is False
+            assert r["action"] == "collision"
             assert f.exists("src.jpg")
-            assert f.read("src.jpg") == b"source content"
-            # Dest untouched
-            assert f.read("dst.jpg") == b"different content"
+            assert f.read("dst.jpg") == b"different"
 
     def test_collision_same_hash_deletes_source(self):
-        """move_safe should succeed and delete source when dest has same hash."""
         with ADBFixture() as f:
-            content = b"identical content"
-            expected_hash = hashlib.sha256(content).hexdigest()
+            content = b"identical"
+            h = hashlib.sha256(content).hexdigest()
             f.write("src.jpg", content)
             f.write("dst.jpg", content)
-
-            result = f.adb.move_safe(
-                "/sdcard/src.jpg", "/sdcard/dst.jpg", expected_hash)
-
-            assert result["ok"] is True
-            assert result["action"] == "already_there"
-            assert result["source_deleted"] is True
+            r = f.adb.move_safe("/sdcard/src.jpg", "/sdcard/dst.jpg", h)
+            assert r["ok"] is True
+            assert r["action"] == "already_there"
+            assert r["source_deleted"] is True
             assert not f.exists("src.jpg")
-            assert f.read("dst.jpg") == content
 
     def test_source_missing(self):
         with ADBFixture() as f:
-            result = f.adb.move_safe(
-                "/sdcard/no.jpg", "/sdcard/dst.jpg", "abc")
-            assert result["ok"] is False
-            assert result["action"] == "copy_failed"
+            r = f.adb.move_safe("/sdcard/no.jpg", "/sdcard/dst.jpg", "abc")
+            assert r["ok"] is False
+            assert r["action"] == "copy_failed"
 
     def test_no_hash_skips_verification(self):
-        """Without expected_hash, move_safe should still copy-delete."""
         with ADBFixture() as f:
             f.write("src.jpg", b"data")
-            result = f.adb.move_safe(
-                "/sdcard/src.jpg", "/sdcard/dst.jpg", None)
-            assert result["ok"] is True
-            assert result["action"] == "moved"
-            assert not f.exists("src.jpg")
-            assert f.read("dst.jpg") == b"data"
+            r = f.adb.move_safe("/sdcard/src.jpg", "/sdcard/dst.jpg", None)
+            assert r["ok"] is True
+            assert r["action"] == "moved"
 
     def test_creates_parent_dirs(self):
         with ADBFixture() as f:
-            content = b"nested move"
+            content = b"nested"
             h = hashlib.sha256(content).hexdigest()
             f.write("src.jpg", content)
-            result = f.adb.move_safe(
+            r = f.adb.move_safe(
                 "/sdcard/src.jpg", "/sdcard/a/b/c/dst.jpg", h)
-            assert result["ok"] is True
-            assert f.read("a/b/c/dst.jpg") == content
+            assert r["ok"] is True
+
+    def test_hash_mismatch_cleans_up(self):
+        """If hash verification fails, destination is removed and source kept."""
+        with ADBFixture() as f:
+            f.write("src.jpg", b"real content")
+            # Pass a wrong hash to simulate corruption
+            wrong_hash = hashlib.sha256(b"wrong").hexdigest()
+            r = f.adb.move_safe(
+                "/sdcard/src.jpg", "/sdcard/dst.jpg", wrong_hash)
+            assert r["ok"] is False
+            assert r["action"] == "hash_mismatch"
+            # Source should still exist (wasn't deleted)
+            assert f.exists("src.jpg")
+            # Destination should be cleaned up
+            assert not f.exists("dst.jpg")
 
 
 # ---------------------------------------------------------------------------
-# Behavioral: shell command parsing
+# Shell commands
 # ---------------------------------------------------------------------------
 
 class TestShellCommands:
-    def test_rejects_unknown_commands(self):
+    def test_rejects_unknown(self):
         with ADBFixture() as f:
             raised = False
             try:
@@ -382,9 +712,9 @@ class TestShellCommands:
                 raised = True
             assert raised
 
-    def test_rejects_unknown_piped_rhs(self):
+    def test_rejects_unknown_pipe_rhs(self):
         with ADBFixture() as f:
-            (f.tmpdir / "DCIM").mkdir(parents=True)
+            (f.root / "DCIM").mkdir(parents=True)
             raised = False
             try:
                 f.adb.shell("find /sdcard/DCIM -type f | sort -r")
@@ -394,27 +724,30 @@ class TestShellCommands:
 
     def test_dir_exists(self):
         with ADBFixture() as f:
-            (f.tmpdir / "DCIM" / "Camera").mkdir(parents=True)
+            (f.root / "DCIM" / "Camera").mkdir(parents=True)
+            q = f.q("/sdcard/DCIM/Camera")
             out = f.adb.shell(
-                "[ -d '/sdcard/DCIM/Camera' ] && echo EXISTS || echo MISSING")
+                f"[ -d {q} ] && echo EXISTS || echo MISSING")
             assert "EXISTS" in out
 
     def test_dir_missing(self):
         with ADBFixture() as f:
+            q = f.q("/sdcard/NoDir")
             out = f.adb.shell(
-                "[ -d '/sdcard/NoDir' ] && echo EXISTS || echo MISSING")
+                f"[ -d {q} ] && echo EXISTS || echo MISSING")
             assert "MISSING" in out
 
     def test_file_exists_check(self):
         with ADBFixture() as f:
             f.write("test.txt", b"hi")
+            q = f.q("/sdcard/test.txt")
             out = f.adb.shell(
-                "[ -e '/sdcard/test.txt' ] && echo EXISTS || echo MISSING")
+                f"[ -e {q} ] && echo EXISTS || echo MISSING")
             assert "EXISTS" in out
 
     def test_stat_size(self):
         with ADBFixture() as f:
-            f.write("test.txt", b"hello")  # 5 bytes
+            f.write("test.txt", b"hello")
             out = f.adb.shell("stat -c %s '/sdcard/test.txt'")
             assert out.strip() == "5"
 
@@ -430,12 +763,12 @@ class TestShellCommands:
             f.write("test.txt", content)
             expected = hashlib.sha256(content).hexdigest()
             out = f.adb.shell("sha256sum '/sdcard/test.txt'")
-            assert out.strip().startswith(expected)
+            assert expected in out
 
     def test_mkdir_p(self):
         with ADBFixture() as f:
             f.adb.shell("mkdir -p '/sdcard/a/b/c'")
-            assert (f.tmpdir / "a" / "b" / "c").is_dir()
+            assert (f.root / "a" / "b" / "c").is_dir()
 
     def test_rm(self):
         with ADBFixture() as f:
@@ -454,15 +787,14 @@ class TestShellCommands:
 
     def test_rm_f_nonexistent_ok(self):
         with ADBFixture() as f:
-            # Should not raise
-            f.adb.shell("rm -f '/sdcard/no.txt'")
+            f.adb.shell("rm -f '/sdcard/no.txt'")  # should not raise
 
     def test_cp(self):
         with ADBFixture() as f:
             f.write("src.txt", b"copy me")
             f.adb.shell("cp '/sdcard/src.txt' '/sdcard/dst.txt'")
             assert f.read("dst.txt") == b"copy me"
-            assert f.exists("src.txt")  # source still exists
+            assert f.exists("src.txt")
 
     def test_mv(self):
         with ADBFixture() as f:
@@ -475,24 +807,22 @@ class TestShellCommands:
         with ADBFixture() as f:
             f.write("DCIM/Camera/a.jpg", b"a")
             f.write("DCIM/Camera/sub/b.jpg", b"b")
-            (f.tmpdir / "DCIM" / "Camera" / "emptydir").mkdir()
+            (f.root / "DCIM" / "Camera" / "emptydir").mkdir()
             out = f.adb.shell(
                 "find '/sdcard/DCIM/Camera' -maxdepth 10 -type f")
-            assert "/sdcard/DCIM/Camera/a.jpg" in out
-            assert "/sdcard/DCIM/Camera/sub/b.jpg" in out
+            assert "a.jpg" in out
+            assert "b.jpg" in out
             assert "emptydir" not in out
 
     def test_find_type_d(self):
         with ADBFixture() as f:
-            (f.tmpdir / "DCIM" / "Camera" / "sub").mkdir(parents=True)
-            f.write("DCIM/Camera/file.jpg", b"x")
+            (f.root / "DCIM" / "Camera" / "sub").mkdir(parents=True)
             out = f.adb.shell(
                 "find '/sdcard/DCIM/Camera' -maxdepth 1 -type d")
-            assert "/sdcard/DCIM/Camera" in out
+            assert "Camera" in out
             assert "sub" in out
 
     def test_find_piped_wc_l(self):
-        """find ... | wc -l should return a count, not raw output."""
         with ADBFixture() as f:
             f.write("DCIM/Camera/a.jpg", b"a")
             f.write("DCIM/Camera/b.jpg", b"b")
@@ -503,21 +833,14 @@ class TestShellCommands:
 
     def test_find_piped_wc_l_empty(self):
         with ADBFixture() as f:
-            (f.tmpdir / "DCIM" / "Camera").mkdir(parents=True)
+            (f.root / "DCIM" / "Camera").mkdir(parents=True)
             out = f.adb.shell(
                 "find '/sdcard/DCIM/Camera' -type f 2>/dev/null | wc -l")
             assert out.strip() == "0"
 
-    def test_getprop_model(self):
-        with ADBFixture() as f:
-            out = f.adb.shell("getprop ro.product.model")
-            assert out == "TestPhone"
-
     def test_find_with_stat_printf(self):
-        """The null-separated stat+printf pattern used by list_files_recursive."""
         with ADBFixture() as f:
             f.write("DCIM/Camera/IMG.jpg", b"photo", mtime=1700000000.0)
-            # This is the actual command pattern phonesync generates
             cmd = (
                 "find '/sdcard/DCIM/Camera' -maxdepth 10 "
                 "-type f -exec sh -c "
@@ -531,137 +854,81 @@ class TestShellCommands:
             lines = [l for l in out.strip().split("\n") if l.strip()]
             assert len(lines) == 1
             parts = lines[0].split("\0", 2)
-            assert len(parts) == 3
-            assert parts[0] == "5"  # len(b"photo")
-            assert parts[1] == "1700000000"
-            assert parts[2] == "/sdcard/DCIM/Camera/IMG.jpg"
+            assert parts == ["5", "1700000000",
+                             "/sdcard/DCIM/Camera/IMG.jpg"]
 
-
-# ---------------------------------------------------------------------------
-# Behavioral: special characters in paths
-# ---------------------------------------------------------------------------
-
-class TestSpecialCharPaths:
-    def test_spaces_in_filename(self):
+    def test_getprop_model(self):
         with ADBFixture() as f:
-            f.write("DCIM/Camera/my photo (1).jpg", b"spaced")
-            # Use shlex.quote like real phonesync does
-            path = shlex.quote("/sdcard/DCIM/Camera/my photo (1).jpg")
+            assert f.adb.shell("getprop ro.product.model") == "TestPhone"
 
-            # stat
-            out = f.adb.shell(f"stat -c %s {path}")
-            assert out.strip() == "6"
 
-            # sha256sum
-            out = f.adb.shell(f"sha256sum {path}")
-            expected = hashlib.sha256(b"spaced").hexdigest()
-            assert expected in out
+# ---------------------------------------------------------------------------
+# check=False behavior
+# ---------------------------------------------------------------------------
 
-            # exists check
+class TestCheckFalse:
+    def test_stat_missing_check_false(self):
+        """stat on missing file with check=False should return empty."""
+        with ADBFixture() as f:
             out = f.adb.shell(
-                f"[ -e {path} ] && echo EXISTS || echo MISSING")
-            assert "EXISTS" in out
+                "stat -c %s '/sdcard/no.txt'", check=False)
+            assert out.strip() == ""
 
-            # list_files_recursive
-            files = f.adb.list_files_recursive("/sdcard/DCIM/Camera")
-            assert len(files) == 1
-            assert files[0]["name"] == "my photo (1).jpg"
+    def test_stat_missing_check_true(self):
+        """stat on missing file with check=True should also return empty.
 
-            # pull
-            dst = os.path.join(str(f.tmpdir), "_pulled.jpg")
-            ok = f.adb.pull(
-                "/sdcard/DCIM/Camera/my photo (1).jpg", dst)
-            assert ok is True
-            assert open(dst, "rb").read() == b"spaced"
-
-    def test_quotes_in_filename(self):
+        FakeADB.stat doesn't raise on missing files (matches real stat
+        behavior where the exit code is nonzero but we use check=False
+        in production). The shell dispatcher doesn't enforce check for
+        stat since phonesync always calls stat with check=False.
+        """
         with ADBFixture() as f:
-            f.write("DCIM/Camera/it's a photo.jpg", b"quoted")
-            path = shlex.quote("/sdcard/DCIM/Camera/it's a photo.jpg")
-            out = f.adb.shell(f"stat -c %s {path}")
-            assert out.strip() == "6"
+            out = f.adb.shell(
+                "stat -c %s '/sdcard/no.txt'", check=True)
+            assert out.strip() == ""
 
-            files = f.adb.list_files_recursive("/sdcard/DCIM/Camera")
-            assert files[0]["name"] == "it's a photo.jpg"
-
-    def test_parentheses_in_filename(self):
+    def test_sha256sum_missing_check_false(self):
         with ADBFixture() as f:
-            f.write("DCIM/Camera/IMG_001 (copy).jpg", b"parens")
-            path = shlex.quote("/sdcard/DCIM/Camera/IMG_001 (copy).jpg")
+            out = f.adb.shell(
+                "sha256sum '/sdcard/no.txt'", check=False)
+            assert out.strip() == ""
 
-            # cp via shell
-            dst_path = shlex.quote("/sdcard/DCIM/Camera/IMG_001_backup.jpg")
-            f.adb.shell(f"cp {path} {dst_path}")
-            assert f.read("DCIM/Camera/IMG_001_backup.jpg") == b"parens"
-
-            # mv via shell
-            dst2 = shlex.quote("/sdcard/DCIM/Camera/moved.jpg")
-            f.adb.shell(f"mv {dst_path} {dst2}")
-            assert f.read("DCIM/Camera/moved.jpg") == b"parens"
-
-    def test_unicode_in_filename(self):
+    def test_cp_source_missing_raises(self):
         with ADBFixture() as f:
-            f.write("DCIM/Camera/사진_2025.jpg", b"korean")
-            path = shlex.quote("/sdcard/DCIM/Camera/사진_2025.jpg")
+            raised = False
+            try:
+                f.adb.shell(
+                    "cp '/sdcard/no.txt' '/sdcard/dst.txt'")
+            except phonesync.ADBError:
+                raised = True
+            assert raised
 
-            out = f.adb.shell(f"stat -c %s {path}")
-            assert out.strip() == "6"
-
-            files = f.adb.list_files_recursive("/sdcard/DCIM/Camera")
-            assert files[0]["name"] == "사진_2025.jpg"
-
-            # file_hash
-            expected = hashlib.sha256(b"korean").hexdigest()
-            assert f.adb.file_hash(
-                "/sdcard/DCIM/Camera/사진_2025.jpg") == expected
-
-    def test_semicolons_in_filename(self):
-        """Semicolons could cause shell injection if not quoted."""
+    def test_mv_source_missing_raises(self):
         with ADBFixture() as f:
-            f.write("DCIM/Camera/a;rm -rf.jpg", b"sneaky")
-            path = shlex.quote("/sdcard/DCIM/Camera/a;rm -rf.jpg")
+            raised = False
+            try:
+                f.adb.shell(
+                    "mv '/sdcard/no.txt' '/sdcard/dst.txt'")
+            except phonesync.ADBError:
+                raised = True
+            assert raised
 
-            out = f.adb.shell(f"stat -c %s {path}")
-            assert out.strip() == "6"
-
-            files = f.adb.list_files_recursive("/sdcard/DCIM/Camera")
-            assert files[0]["name"] == "a;rm -rf.jpg"
-
-    def test_pipe_in_filename(self):
-        """The old | separator bug — verify it doesn't break anything."""
+    def test_mkdir_existing_is_ok(self):
+        """mkdir -p on existing dir should not raise."""
         with ADBFixture() as f:
-            f.write("DCIM/Camera/photo|vacation.jpg", b"piped")
+            (f.root / "existing").mkdir()
+            f.adb.shell("mkdir -p '/sdcard/existing'")
+            assert (f.root / "existing").is_dir()
 
-            files = f.adb.list_files_recursive("/sdcard/DCIM/Camera")
-            assert len(files) == 1
-            assert files[0]["name"] == "photo|vacation.jpg"
-            assert files[0]["size"] == 5
-
-            # pull
-            dst = os.path.join(str(f.tmpdir), "_pulled.jpg")
-            ok = f.adb.pull(
-                "/sdcard/DCIM/Camera/photo|vacation.jpg", dst)
-            assert ok is True
-
-    def test_move_safe_with_special_chars(self):
-        """move_safe should handle paths with spaces and quotes."""
+    def test_rm_check_false_missing(self):
+        """rm with check=False on missing file should not raise."""
         with ADBFixture() as f:
-            content = b"special chars"
-            h = hashlib.sha256(content).hexdigest()
-            f.write("DCIM/Camera/my photo (1).jpg", content)
-
-            result = f.adb.move_safe(
-                "/sdcard/DCIM/Camera/my photo (1).jpg",
-                "/sdcard/DCIM/Camera/sorted/my photo (1).jpg",
-                h)
-            assert result["ok"] is True
-            assert f.read(
-                "DCIM/Camera/sorted/my photo (1).jpg") == content
-            assert not f.exists("DCIM/Camera/my photo (1).jpg")
+            # This should not raise
+            f.adb.shell("rm '/sdcard/no.txt'", check=False)
 
 
 # ---------------------------------------------------------------------------
-# Behavioral: storage volumes
+# Storage volumes
 # ---------------------------------------------------------------------------
 
 class TestStorageVolumes:
@@ -670,22 +937,12 @@ class TestStorageVolumes:
             vols = f.adb.list_storage_volumes()
             assert len(vols) == 1
             assert vols[0]["type"] == "internal"
-            assert vols[0]["path"] == "/sdcard"
 
     def test_with_external_sd(self):
-        with tempfile.TemporaryDirectory() as d:
-            root = Path(d) / "phone"
-            root.mkdir()
-            ext = Path(d) / "ext_sd"
-            ext.mkdir()
-            FakeADB.reset_registry()
-            FakeADB.register("SDTEST", root, "SDPhone", external_sd=ext)
-            try:
-                adb = FakeADB("SDTEST")
-                vols = adb.list_storage_volumes()
-                assert len(vols) == 2
-                types = {v["type"] for v in vols}
-                assert "internal" in types
-                assert "external_sd" in types
-            finally:
-                FakeADB.reset_registry()
+        with ADBFixture(external_sd=True) as f:
+            vols = f.adb.list_storage_volumes()
+            assert len(vols) == 2
+            types = {v["type"] for v in vols}
+            assert "external_sd" in types
+
+

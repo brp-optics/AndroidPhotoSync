@@ -14,12 +14,12 @@ import sys
 import traceback
 from pathlib import Path
 
-# Add project root to path
+# Add project root and test dir to path
 sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(Path(__file__).parent / "test"))
 
-# Import fixtures
-from test.conftest import TestHarness
+# Import fixtures — use bare 'conftest' (same as test files)
+from conftest import TestHarness
 
 
 def make_img_data():
@@ -41,29 +41,33 @@ def make_img_data():
 
 def run_test_method(cls, method_name, verbose=False):
     """Run a single test method with fixtures."""
-    harness = TestHarness()
-    harness.__enter__()
-    try:
-        instance = cls()
-        method = getattr(instance, method_name)
+    instance = cls()
+    method = getattr(instance, method_name)
 
-        # Inspect method signature to inject fixtures
-        sig = inspect.signature(method)
+    # Inspect method signature to determine which fixtures are needed
+    sig = inspect.signature(method)
+    needs_harness = "harness" in sig.parameters
+    needs_img_data = "img_data" in sig.parameters
+
+    harness = None
+    if needs_harness:
+        harness = TestHarness()
+        harness.__enter__()
+
+    try:
         kwargs = {}
-        for param_name in sig.parameters:
-            if param_name == "self":
-                continue
-            if param_name == "harness":
-                kwargs["harness"] = harness
-            elif param_name == "img_data":
-                kwargs["img_data"] = make_img_data()
+        if needs_harness:
+            kwargs["harness"] = harness
+        if needs_img_data:
+            kwargs["img_data"] = make_img_data()
 
         method(**kwargs)
         return True, None
     except Exception as e:
         return False, (e, traceback.format_exc())
     finally:
-        harness.__exit__(None, None, None)
+        if harness:
+            harness.__exit__(None, None, None)
 
 
 def discover_tests(test_dir, pattern=None):

@@ -98,9 +98,26 @@ class FakeADB:
 
     @staticmethod
     def _has_pipe(cmd: str) -> bool:
-        """Check if cmd contains a real pipe (|) not a logical OR (||)."""
-        import re
-        return bool(re.search(r'(?<!\|)\|(?!\|)', cmd))
+        """Check if cmd contains a real pipe (|) not inside quotes or ||."""
+        in_single = False
+        in_double = False
+        i = 0
+        while i < len(cmd):
+            c = cmd[i]
+            if c == "'" and not in_double:
+                in_single = not in_single
+            elif c == '"' and not in_single:
+                in_double = not in_double
+            elif c == '\\' and not in_single:
+                i += 1  # skip escaped char
+            elif c == '|' and not in_single and not in_double:
+                # Check it's not ||
+                if i + 1 < len(cmd) and cmd[i + 1] == '|':
+                    i += 1  # skip ||
+                else:
+                    return True
+            i += 1
+        return False
 
     def _run(self, args, check=True, capture=True, timeout=120):
         """Not used by FakeADB — shell() handles everything."""
@@ -187,12 +204,19 @@ class FakeADB:
 
     def _shell_test(self, cmd: str) -> str:
         """Handle [ -d path ] / [ -e path ] tests."""
-        # Parse: [ -d '/path' ] && echo EXISTS || echo MISSING
+        # Extract everything between [ and the matching ]
+        # then use shlex.split to properly unquote the path.
+        # Command format: [ -d <quoted_path> ] && echo EXISTS || echo MISSING
+        bracket_end = cmd.find("] &&")
+        if bracket_end == -1:
+            bracket_end = cmd.find("] ||")
+        if bracket_end == -1:
+            return "MISSING"
+        inner = cmd[1:bracket_end].strip()  # strip the leading [
         try:
-            tokens = shlex.split(cmd.split("]")[0].replace("[", "").strip())
+            tokens = shlex.split(inner)
         except ValueError:
             return "MISSING"
-        # tokens like ['-d', '/path']
         if len(tokens) >= 2:
             flag = tokens[0]
             path = tokens[1]
@@ -301,12 +325,8 @@ class FakeADB:
         """Handle find commands."""
         import re
 
-        # Extract directory (first shlex token after 'find')
-        # This is tricky because find commands have complex syntax.
-        # We parse known flags rather than trying to shlex the whole thing.
-        rest = cmd[len("find "):].strip()
+        rest = cmd[len('find '):].strip()
 
-        # Extract the directory (first non-option token)
         directory = None
         try:
             tokens = shlex.split(rest)
@@ -314,80 +334,102 @@ class FakeADB:
             tokens = rest.split()
 
         for t in tokens:
-            if not t.startswith("-") and not t.startswith("\\"):
+            if not t.startswith('-') and not t.startswith('\\'):
                 directory = t
                 break
         if not directory:
-            return ""
+            return ''
         local_dir = self._local(directory)
         if not local_dir.is_dir():
-            return ""
+            return ''
 
-        # Parse options
         max_depth = 999
         m = re.search(r'-maxdepth\s+(\d+)', cmd)
         if m:
             max_depth = int(m.group(1))
 
         type_filter = None
-        if "-type d" in cmd:
-            type_filter = "d"
-        elif "-type f" in cmd:
-            type_filter = "f"
+        if '-type d' in cmd:
+            type_filter = 'd'
+        elif '-type f' in cmd:
+            type_filter = 'f'
 
-        # Check for our printf+stat pattern (null-separated format)
-        if "printf" in cmd and "stat" in cmd:
+        # Extract prune dir names from -name '...' -prune patterns
+        prune_names = re.findall(r"-name\s+'([^']+)'\s+-prune", cmd)
+        if not prune_names:
+            prune_names = re.findall(r'-name\s+"([^"]+)"\s+-prune', cmd)
+
+        if 'printf' in cmd and 'stat' in cmd:
             return self._find_with_stat(local_dir, directory,
-                                         max_depth, type_filter)
+                                         max_depth, type_filter, prune_names)
 
-        # Simple find: return paths
         return self._find_simple(local_dir, directory,
-                                  max_depth, type_filter)
+                                  max_depth, type_filter, prune_names)
 
-    def _find_with_stat(self, local_dir: Path, phone_base: str,
-                        max_depth: int, type_filter: str) -> str:
-        """Handle find -exec sh -c 'printf ... stat ...' pattern."""
+    def _find_with_stat(self, local_dir, phone_base, max_depth, type_filter,
+                        prune_names=None):
+        if prune_names is None:
+            prune_names = []
         lines = []
         for root, dirs, files in os.walk(str(local_dir)):
             depth = str(root).count(os.sep) - str(local_dir).count(os.sep)
             if depth >= max_depth:
                 dirs.clear()
                 continue
-            if type_filter != "f":
+            dirs[:] = [d for d in dirs if d not in prune_names]
+            if type_filter != 'f':
                 continue
             for fname in files:
                 fpath = Path(root) / fname
-                rel_to_root = fpath.relative_to(self.root)
-                phone_path = f"/sdcard/{rel_to_root}"
+                phone_path = self._phone_path(fpath)
                 st = fpath.stat()
-                lines.append(
-                    f"{st.st_size}\0{int(st.st_mtime)}\0{phone_path}")
+                lines.append(f"{st.st_size}\0{int(st.st_mtime)}\0{phone_path}")
         return "\n".join(lines)
 
-    def _find_simple(self, local_dir: Path, phone_base: str,
-                     max_depth: int, type_filter: str) -> str:
-        """Handle simple find commands returning path lists."""
+    def _find_simple(self, local_dir, phone_base, max_depth, type_filter,
+                     prune_names=None):
+        if prune_names is None:
+            prune_names = []
         results = []
         for root, dirs, files in os.walk(str(local_dir)):
             depth = str(root).count(os.sep) - str(local_dir).count(os.sep)
             if depth >= max_depth:
                 dirs.clear()
                 continue
-            rel = Path(root).relative_to(self.root)
-            phone_path = f"/sdcard/{rel}"
-            if type_filter == "d":
+            dirs[:] = [d for d in dirs if d not in prune_names]
+            phone_path = self._phone_path(Path(root))
+            if type_filter == 'd':
                 if depth == 0:
                     results.append(phone_path)
                 for d in dirs:
-                    d_rel = (Path(root) / d).relative_to(self.root)
-                    results.append(f"/sdcard/{d_rel}")
-            elif type_filter == "f":
+                    results.append(self._phone_path(Path(root) / d))
+            elif type_filter == 'f':
                 for fname in files:
-                    f_rel = (Path(root) / fname).relative_to(self.root)
-                    results.append(f"/sdcard/{f_rel}")
+                    results.append(self._phone_path(Path(root) / fname))
             else:
                 results.append(phone_path)
         return "\n".join(results)
+
+    def _phone_path(self, local_path: Path) -> str:
+        """Map a local fake-storage path back to a phone-visible path."""
+        local_path = Path(local_path)
+
+        try:
+            rel = local_path.relative_to(self.root)
+            return f"/sdcard/{rel}"
+        except ValueError:
+            pass
+
+        if self.external_sd:
+            try:
+                rel = local_path.relative_to(self.external_sd)
+                return f"/storage/EXT_SD/{rel}"
+            except ValueError:
+                pass
+
+        raise ValueError(
+            f"{local_path!s} is not under fake internal or external storage"
+        )
 
     def _shell_ls(self, cmd: str) -> str:
         """Handle ls commands."""
@@ -409,8 +451,7 @@ class FakeADB:
             results = []
             for item in local_dir.iterdir():
                 if item.is_dir():
-                    rel = item.relative_to(self.root)
-                    results.append(f"/sdcard/{rel}/")
+                    results.append(self._phone_path(item) + "/")
             return "\n".join(results)
         return ""
 
@@ -447,8 +488,7 @@ class FakeADB:
 
                 fpath = Path(root) / fname
                 st = fpath.stat()
-                rel_to_root = fpath.relative_to(self.root)
-                phone_path = f"/sdcard/{rel_to_root}"
+                phone_path = self._phone_path(fpath)
                 rel_to_dir = fpath.relative_to(local_dir)
                 relpath = str(rel_to_dir)
 
@@ -571,6 +611,8 @@ class FakeADB:
                 "id": "EXT_SD",
             })
         return volumes
+
+    
 
 
 # ---------------------------------------------------------------------------
