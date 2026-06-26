@@ -115,11 +115,62 @@ class FakeADB:
             i += 1
         return False
 
+    @staticmethod
+    def _strip_unquoted_stderr_redirect(cmd: str) -> str:
+        """Remove unquoted stderr redirects without touching filenames.
+
+        phonesync commonly appends ``2>/dev/null`` to shell commands. A
+        filename may also literally contain that text, so we only strip it
+        when it appears outside single or double quotes.
+        """
+        out = []
+        in_single = False
+        in_double = False
+        i = 0
+
+        while i < len(cmd):
+            c = cmd[i]
+
+            if c == "'" and not in_double:
+                in_single = not in_single
+                out.append(c)
+                i += 1
+                continue
+
+            if c == '"' and not in_single:
+                in_double = not in_double
+                out.append(c)
+                i += 1
+                continue
+
+            if c == '\\' and not in_single:
+                if i + 1 < len(cmd):
+                    out.append(cmd[i])
+                    out.append(cmd[i + 1])
+                    i += 2
+                else:
+                    out.append(c)
+                    i += 1
+                continue
+
+            if not in_single and not in_double:
+                if cmd.startswith("2>/dev/null", i):
+                    i += len("2>/dev/null")
+                    continue
+                if cmd.startswith("2> /dev/null", i):
+                    i += len("2> /dev/null")
+                    continue
+
+            out.append(c)
+            i += 1
+
+        return "".join(out).strip()
+
     def _run(self, args, check=True, capture=True, timeout=120):
         raise NotImplementedError("FakeADB._run() not implemented")
 
     def shell(self, cmd: str, check=True, timeout=120) -> str:
-        cmd = cmd.replace("2>/dev/null", "").strip()
+        cmd = self._strip_unquoted_stderr_redirect(cmd)
         if self._has_pipe(cmd):
             return self._shell_piped(cmd, check, timeout)
         if cmd.startswith("[ -d ") or cmd.startswith("[ -e "):
@@ -206,15 +257,21 @@ class FakeADB:
         rest = cmd[len("sha256sum "):].strip()
         path = self._unquote(rest)
         local = self._local(path)
-        if local.exists():
-            h = hashlib.sha256(local.read_bytes()).hexdigest()
-            return f"{h}  {path}"
+        try:
+            if local.exists() and local.is_file():
+                h = hashlib.sha256(local.read_bytes()).hexdigest()
+                return f"{h}  {path}"
+        except OSError:
+            pass
         return ""
 
     def _shell_mkdir(self, cmd):
         rest = cmd[len("mkdir -p "):].strip()
         path = self._unquote(rest)
-        self._local(path).mkdir(parents=True, exist_ok=True)
+        try:
+            self._local(path).mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            raise phonesync.ADBError(f"mkdir: {path}: {e}")
         return ""
 
     def _shell_rm(self, cmd, check):
@@ -224,10 +281,18 @@ class FakeADB:
             rest = rest[3:].strip()
         path = self._unquote(rest)
         local = self._local(path)
-        if local.exists():
-            local.unlink()
-        elif not force and check:
-            raise phonesync.ADBError(f"rm: {path}: No such file")
+        try:
+            if local.exists():
+                if local.is_dir():
+                    if check and not force:
+                        raise phonesync.ADBError(f"rm: {path}: Is a directory")
+                    return ""
+                local.unlink()
+            elif not force and check:
+                raise phonesync.ADBError(f"rm: {path}: No such file")
+        except OSError as e:
+            if check and not force:
+                raise phonesync.ADBError(f"rm: {path}: {e}")
         return ""
 
     def _shell_cp(self, cmd):
@@ -422,14 +487,22 @@ class FakeADB:
 
     def delete(self, remote_path: str) -> bool:
         local = self._local(remote_path)
-        if local.exists():
-            local.unlink()
-            return True
+        try:
+            if local.exists():
+                if local.is_dir():
+                    return False
+                local.unlink()
+                return True
+        except OSError:
+            return False
         return False
 
     def mkdir(self, remote_path: str) -> bool:
-        self._local(remote_path).mkdir(parents=True, exist_ok=True)
-        return True
+        try:
+            self._local(remote_path).mkdir(parents=True, exist_ok=True)
+            return True
+        except OSError:
+            return False
 
     def move(self, remote_src: str, remote_dst: str) -> bool:
         src = self._local(remote_src)
@@ -485,8 +558,11 @@ class FakeADB:
 
     def file_hash(self, remote_path: str) -> Optional[str]:
         local = self._local(remote_path)
-        if local.exists():
-            return hashlib.sha256(local.read_bytes()).hexdigest()
+        try:
+            if local.exists() and local.is_file():
+                return hashlib.sha256(local.read_bytes()).hexdigest()
+        except OSError:
+            pass
         return None
 
     def get_model(self) -> str:
