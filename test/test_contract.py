@@ -944,5 +944,3 @@ class TestStorageVolumes:
             assert len(vols) == 2
             types = {v["type"] for v in vols}
             assert "external_sd" in types
-
-
