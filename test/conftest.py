@@ -96,6 +96,12 @@ class FakeADB:
         except ValueError:
             return token.strip("'\"")
 
+    @staticmethod
+    def _has_pipe(cmd: str) -> bool:
+        """Check if cmd contains a real pipe (|) not a logical OR (||)."""
+        import re
+        return bool(re.search(r'(?<!\|)\|(?!\|)', cmd))
+
     def _run(self, args, check=True, capture=True, timeout=120):
         """Not used by FakeADB — shell() handles everything."""
         raise NotImplementedError("FakeADB._run() not implemented")
@@ -106,10 +112,11 @@ class FakeADB:
         Supports the specific command patterns used by phonesync.
         Raises NotImplementedError for unrecognized commands.
         """
-        cmd = cmd.strip()
+        # Strip stderr redirects (common in phonesync commands)
+        cmd = cmd.replace("2>/dev/null", "").strip()
 
-        # --- Piped commands: handle the pipe first ---
-        if "|" in cmd:
+        # --- Piped commands: handle single | (not || or &&) ---
+        if self._has_pipe(cmd):
             return self._shell_piped(cmd, check, timeout)
 
         # --- [ -d path ] && echo EXISTS || echo MISSING ---
