@@ -283,6 +283,9 @@ Notes: the rule matches on the **USB hardware serial**, which is set by `--appro
 - **`phonesync doctor`** — verify that the phone's `find`/`stat`/`printf` scan command behaves as expected on the device's toybox before trusting a large sync.
 - The reserved config keys listed above.
 
-## Notes / ideas
+## Notes / ideas / future features
 
 - Per-source-directory configurable destinations.
+- Multiple destination directories (currently all phones map to subfolders of the same PhoneSync directory)
+- Progress bar / time estimation (and early abort?)
+
