@@ -421,10 +421,13 @@ class ADB:
             return []
 
         # Build find command with exclusions
-        # Use printf with \0 field separators for safe filename handling.
-        # Output format per file: "size\0mtime\0filepath\n"
-        # \0 is the only character illegal in filenames on both Linux and
-        # Android, so this is guaranteed safe regardless of filename content.
+        # Use printf with \0 field AND record separators for fully safe
+        # filename handling. Output is a flat NUL-separated stream of
+        # fields: size\0 mtime\0 filepath\0 size\0 mtime\0 filepath\0 ...
+        # \0 is the only byte illegal in filenames on both Linux and
+        # Android, so neither a field nor a record separator can ever
+        # appear inside a value. (A newline record terminator would break
+        # on filenames that legally contain '\n'.)
         prune_clauses = []
         for ed in exclude_dirs:
             prune_clauses.append(f'-name {q(ed)} -prune')
@@ -434,7 +437,7 @@ class ADB:
             'for f; do '
             's=$(stat -c %s "$f") && '
             'm=$(stat -c %Y "$f") && '
-            'printf "%s\\0%s\\0%s\\n" "$s" "$m" "$f"; '
+            'printf "%s\\0%s\\0%s\\0" "$s" "$m" "$f"; '
             'done'
         )
 
@@ -454,17 +457,20 @@ class ADB:
         output = self.shell(find_cmd, check=False, timeout=300)
         files = []
 
-        for line in output.strip().split("\n"):
-            line = line.strip()
-            if not line or "\0" not in line:
-                continue
-            parts = line.split("\0", 2)
-            if len(parts) != 3:
-                continue
+        # Parse the flat NUL-separated field stream in groups of three.
+        # A trailing empty token (after the final \0) is ignored.
+        tokens = output.split("\0")
+        # Drop a trailing empty element from the final record separator.
+        if tokens and tokens[-1] == "":
+            tokens.pop()
+
+        for i in range(0, len(tokens) - 2, 3):
+            size_s = tokens[i]
+            mtime_s = tokens[i + 1]
+            filepath = tokens[i + 2]
             try:
-                size = int(parts[0])
-                mtime = int(parts[1])
-                filepath = parts[2]
+                size = int(size_s)
+                mtime = int(mtime_s)
                 name = os.path.basename(filepath)
 
                 # Check file exclusion patterns
@@ -492,11 +498,36 @@ class ADB:
             except (ValueError, IndexError):
                 continue
 
+        # Distinguish a genuinely empty directory from a failed scan. The
+        # directory existed (the [ -d ] check above said EXISTS), so if we
+        # parsed zero files we probe the device. An unreachable device means
+        # the empty result is a transport failure, not an empty folder —
+        # raise so the caller can abort rather than silently treating the
+        # directory as having no files.
+        if not files:
+            if not self.is_reachable():
+                raise ADBError(
+                    f"Scan of {remote_dir} returned no files and the device "
+                    f"is no longer reachable — aborting to avoid acting on a "
+                    f"partial/empty snapshot.")
+
         return files
 
     def list_files(self, remote_dir: str) -> list[dict]:
         """Non-recursive listing (backward compat wrapper)."""
         return self.list_files_recursive(remote_dir, max_depth=1)
+
+    def is_reachable(self) -> bool:
+        """Return True if the device responds to a trivial shell command.
+
+        Used to distinguish a genuinely empty/missing directory from a
+        dropped connection (USB unplugged, daemon dead, device offline).
+        """
+        try:
+            out = self.shell("echo __PS_OK__", check=True, timeout=15)
+            return "__PS_OK__" in out
+        except ADBError:
+            return False
 
     def pull(self, remote_path: str, local_path: str) -> bool:
         try:
@@ -860,6 +891,7 @@ class SyncEngine:
         }
         self.discovered_subdirs = []
         self.deleted_files = []  # [(relpath, category)] for deletion report
+        self._scan_failed = False
         # Relpaths whose phone_path was updated by phone-side move detection
         # in the current run. Phase 3 must not immediately "repair" those
         # back to the computer-derived desired phone path.
@@ -996,8 +1028,22 @@ class SyncEngine:
         logging.info(f"{'[DRY RUN] ' if self.dry_run else ''}Starting sync for "
                      f"{self.device_name} ({self.device_serial})")
 
-        # Scan the phone ONCE — all phases share this snapshot
-        self.phone_scan = self._scan_phone()
+        # Scan the phone ONCE — all phases share this snapshot. If the scan
+        # fails (device unreachable, transport error), abort the ENTIRE run
+        # before any phase mutates state. Acting on a partial/empty snapshot
+        # could mis-tombstone or mis-move files we simply couldn't see.
+        try:
+            self.phone_scan = self._scan_phone()
+        except ADBError as e:
+            self.stats["errors"] += 1
+            logging.error(
+                f"ABORTING sync for {self.device_name}: phone scan failed.")
+            logging.error(f"  {e}")
+            logging.error(
+                "  No files were changed and state was not saved. "
+                "Reconnect the device and try again.")
+            self._scan_failed = True
+            return False
 
         # Phase 1: Detect phone-side moves (must happen before ingest
         # so moved files aren't re-ingested as new)
@@ -1013,6 +1059,7 @@ class SyncEngine:
             self.state.save()
 
         self._print_summary()
+        return True
 
     def _scan_phone(self) -> dict:
         """Scan all configured phone source directories once.
@@ -1028,6 +1075,14 @@ class SyncEngine:
         exclude_dirs = self.cfg.get("exclude_dirs", DEFAULT_EXCLUDE_DIRS)
         exclude_files = self.cfg.get("exclude_files", DEFAULT_EXCLUDE_FILES)
         recursive = self.cfg.get("recursive_scan", True)
+
+        # Fail fast if the device isn't reachable before we begin: a partial
+        # or empty scan can cause later phases to mis-handle files they
+        # simply couldn't see (e.g. treat them as deleted).
+        if not self.adb.is_reachable():
+            raise ADBError(
+                f"Device {self.device_name} ({self.device_serial}) is not "
+                f"reachable — aborting before any phase runs.")
 
         scan = {}  # category -> [(phone_dir, [files])]
         self._phone_path_index = {}  # phone_path -> file_info
@@ -1802,12 +1857,20 @@ def cmd_sync(args):
             print(f"Found {len(devices)} device(s): "
                   f"{', '.join(d['model'] for d in devices)}")
 
+        any_failed = False
         for serial in serials:
             engine = SyncEngine(cfg, serial, dry_run=args.dry_run)
-            engine.run()
+            ok = engine.run()
+            if ok is False:
+                any_failed = True
             print()
     finally:
         lock.release()
+
+    if any_failed:
+        # A device scan failed mid-run; surface a non-zero exit so callers
+        # (cron, udev-triggered syncs) can detect the partial failure.
+        sys.exit(2)
 
 
 def cmd_status(args):

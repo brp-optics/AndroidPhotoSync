@@ -42,6 +42,34 @@ class TestScanPhase:
             engine._phone_path_index
         assert "/sdcard/Download/doc.pdf" in engine._phone_path_index
 
+    def test_newline_in_filename_ingested(self, harness):
+        """A photo whose filename contains a newline ingests as ONE file.
+
+        End-to-end guard for the NUL-record-terminator fix: a '\\n' in the
+        name must not split or drop the file during scan/ingest.
+        """
+        # Filename with an embedded newline; date from mtime (2024).
+        name = "holiday\nphoto.jpg"
+        harness.phone_write(
+            "a", f"DCIM/Camera/{name}", b"newline photo data",
+            1719532800.0)  # 2024-06-28
+        # A normal sibling to confirm the stream keeps parsing past it.
+        harness.phone_write(
+            "a", "DCIM/Camera/normal.jpg", b"normal", 1719532800.0)
+
+        engine = harness.sync("a")
+        assert engine.stats["files_copied"] == 2
+
+        # The newline-bearing file landed intact under photos/2024/
+        files = harness.computer_list("photos/2024")
+        assert any(f.endswith("holiday\nphoto.jpg") for f in files), files
+        assert any(f.endswith("normal.jpg") for f in files), files
+
+        # State tracks both, with the full newline name preserved
+        phone_paths = {
+            i["phone_path"] for i in harness.get_state("a")["files"].values()}
+        assert f"/sdcard/DCIM/Camera/{name}" in phone_paths
+
     def test_scan_respects_recursive_false(self, harness, img_data):
         """With recursive_scan=false, files in subdirs aren't ingested."""
         # Reconfigure
@@ -67,6 +95,105 @@ class TestScanPhase:
                             b"thumbnail")
         engine = harness.sync("a")
         assert engine.stats["files_copied"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Scan failure must abort the whole run (no silent partial sync)
+# ---------------------------------------------------------------------------
+
+class TestScanFailureAborts:
+    def test_unreachable_device_aborts_before_phases(self, harness, img_data):
+        """If the device is unreachable up front, run() aborts: nothing
+        copied, no state saved, errors counted."""
+        from conftest import FakeADB
+        c, m = img_data("p", 2025, 1, 15)
+        harness.phone_write("a", "DCIM/Camera/IMG_20250115_001.jpg", c, m)
+
+        # Mark phone A's serial unreachable for this run.
+        FakeADB._unreachable_serials.add("SERIAL_A")
+        try:
+            engine = harness.sync("a")
+        finally:
+            FakeADB._unreachable_serials.discard("SERIAL_A")
+
+        assert engine._scan_failed is True
+        assert engine.stats["errors"] >= 1
+        assert engine.stats["files_copied"] == 0
+        # Nothing committed to the library or state
+        assert not harness.computer_exists(
+            "photos/2025/IMG_20250115_001.jpg")
+        assert harness.state_file_count("a") == 0
+
+    def test_abort_does_not_tombstone_existing_files(self, harness, img_data):
+        """A scan failure must not cause already-synced files to be treated
+        as deleted/tombstoned."""
+        from conftest import FakeADB
+        c, m = img_data("p", 2025, 1, 15)
+        harness.phone_write("a", "DCIM/Camera/IMG_20250115_001.jpg", c, m)
+        harness.sync("a")  # clean first sync
+        assert harness.state_file_count("a") == 1
+
+        # Now the device drops on the next run.
+        FakeADB._unreachable_serials.add("SERIAL_A")
+        try:
+            harness.sync("a")
+        finally:
+            FakeADB._unreachable_serials.discard("SERIAL_A")
+
+        # The existing file is still tracked and NOT tombstoned.
+        relpath = "photos/2025/IMG_20250115_001.jpg"
+        assert harness.state_has_relpath("a", relpath)
+        assert not harness.state_is_tombstoned("a", relpath)
+        # Computer copy untouched.
+        assert harness.computer_exists(relpath)
+
+    def test_mid_scan_disconnect_raises_and_aborts(self, harness, img_data):
+        """If a directory that exists returns no files AND the device has
+        gone unreachable, list_files_recursive raises and the run aborts."""
+        from conftest import FakeADB
+        import phonesync
+
+        c, m = img_data("p", 2025, 1, 15)
+        harness.phone_write("a", "DCIM/Camera/IMG_20250115_001.jpg", c, m)
+
+        # A FakeADB that passes the up-front reachability probe, then "drops"
+        # so that an empty directory result is treated as a transport
+        # failure during the per-directory scan.
+        class DropMidScanADB(FakeADB):
+            def __init__(self, serial):
+                super().__init__(serial)
+                self._probed = False
+
+            def is_reachable(self):
+                # First call (up-front probe) succeeds; afterwards the
+                # device is considered gone.
+                if not self._probed:
+                    self._probed = True
+                    return True
+                return False
+
+            def list_files_recursive(self, remote_dir, exclude_dirs=None,
+                                     exclude_files=None, max_depth=255):
+                # Simulate the directory existing but the scan returning
+                # nothing because the link dropped.
+                if not self.is_reachable():
+                    raise phonesync.ADBError(
+                        f"Scan of {remote_dir} failed: device unreachable")
+                return []
+
+        engine = harness.sync("a", adb_cls=DropMidScanADB)
+        assert engine._scan_failed is True
+        assert engine.stats["files_copied"] == 0
+        assert harness.state_file_count("a") == 0
+
+    def test_empty_dir_reachable_is_not_a_failure(self, harness):
+        """A genuinely empty (or missing) source dir on a reachable device
+        is normal, not an abort."""
+        # No files written at all; device reachable (default).
+        engine = harness.sync("a")
+        assert engine._scan_failed is False
+        assert engine.stats["errors"] == 0
+        assert engine.stats["files_copied"] == 0
 
 
 # ---------------------------------------------------------------------------

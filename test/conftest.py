@@ -57,6 +57,7 @@ class FakeADB:
     @classmethod
     def reset_registry(cls):
         cls._registry.clear()
+        cls._unreachable_serials = set()
 
     def __init__(self, serial: str):
         self.serial = serial
@@ -381,7 +382,9 @@ class FakeADB:
                         prune_names=None):
         if prune_names is None:
             prune_names = []
-        lines = []
+        # Emit a flat NUL-separated field stream with a trailing NUL after
+        # each record, matching the real ADB printf "%s\0%s\0%s\0" format.
+        records = []
         for root, dirs, files in os.walk(str(local_dir)):
             depth = str(root).count(os.sep) - str(local_dir).count(os.sep)
             if depth >= max_depth:
@@ -394,9 +397,9 @@ class FakeADB:
                 fpath = Path(root) / fname
                 phone_path = self._phone_path(fpath)
                 st = fpath.stat()
-                lines.append(
-                    f"{st.st_size}\0{int(st.st_mtime)}\0{phone_path}")
-        return "\n".join(lines)
+                records.append(
+                    f"{st.st_size}\0{int(st.st_mtime)}\0{phone_path}\0")
+        return "".join(records)
 
     def _find_simple(self, local_dir, phone_base, max_depth, type_filter,
                      prune_names=None):
@@ -484,6 +487,13 @@ class FakeADB:
 
     def list_files(self, remote_dir: str) -> list[dict]:
         return self.list_files_recursive(remote_dir, max_depth=1)
+
+    # Test-controllable reachability. Tests can set
+    # FakeADB._unreachable_serials.add(serial) to simulate a dropped device.
+    _unreachable_serials: set = set()
+
+    def is_reachable(self) -> bool:
+        return self.serial not in self._unreachable_serials
 
     def pull(self, remote_path: str, local_path: str) -> bool:
         src = self._local(remote_path)

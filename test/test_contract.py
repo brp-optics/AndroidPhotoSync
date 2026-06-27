@@ -405,7 +405,8 @@ class TestFindWithPrune:
             f.write("DCIM/Camera/.trashed/old.jpg", b"old")
             f.write("DCIM/Camera/sub/also_keep.jpg", b"also", 1700000000.0)
 
-            # This is the actual pattern phonesync generates
+            # This is the actual pattern phonesync generates: NUL-terminated
+            # records (size\0 mtime\0 path\0)...
             cmd = (
                 "find '/sdcard/DCIM/Camera' -maxdepth 10 "
                 "\\( -name '.thumbnails' -prune "
@@ -413,12 +414,14 @@ class TestFindWithPrune:
                 "-type f -exec sh -c 'for f; do "
                 "s=$(stat -c %s \"$f\") && "
                 "m=$(stat -c %Y \"$f\") && "
-                "printf \"%s\\0%s\\0%s\\n\" \"$s\" \"$m\" \"$f\"; "
+                "printf \"%s\\0%s\\0%s\\0\" \"$s\" \"$m\" \"$f\"; "
                 "done' _ {} +"
             )
             out = f.adb.shell(cmd)
-            lines = [l for l in out.strip().split("\n") if l.strip()]
-            paths = [l.split("\0")[2] for l in lines if "\0" in l]
+            tokens = out.split("\0")
+            if tokens and tokens[-1] == "":
+                tokens.pop()
+            paths = [tokens[i + 2] for i in range(0, len(tokens) - 2, 3)]
             assert any("keep.jpg" in p for p in paths)
             assert any("also_keep.jpg" in p for p in paths)
             assert not any(".thumbnails" in p for p in paths)
@@ -847,15 +850,16 @@ class TestShellCommands:
                 "'for f; do "
                 "s=$(stat -c %s \"$f\") && "
                 "m=$(stat -c %Y \"$f\") && "
-                "printf \"%s\\0%s\\0%s\\n\" \"$s\" \"$m\" \"$f\"; "
+                "printf \"%s\\0%s\\0%s\\0\" \"$s\" \"$m\" \"$f\"; "
                 "done' _ {} +"
             )
             out = f.adb.shell(cmd)
-            lines = [l for l in out.strip().split("\n") if l.strip()]
-            assert len(lines) == 1
-            parts = lines[0].split("\0", 2)
-            assert parts == ["5", "1700000000",
-                             "/sdcard/DCIM/Camera/IMG.jpg"]
+            tokens = out.split("\0")
+            if tokens and tokens[-1] == "":
+                tokens.pop()
+            assert len(tokens) == 3  # exactly one record
+            assert tokens == ["5", "1700000000",
+                              "/sdcard/DCIM/Camera/IMG.jpg"]
 
     def test_getprop_model(self):
         with ADBFixture() as f:

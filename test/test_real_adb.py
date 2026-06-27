@@ -647,10 +647,14 @@ class TestListConnectedDevices:
 # ---------------------------------------------------------------------------
 
 class TestADBListFilesParsing:
+    # New wire format: a flat NUL-separated field stream, three fields per
+    # record (size, mtime, filepath), each record terminated by a trailing
+    # NUL: "size\0mtime\0path\0size\0mtime\0path\0..."
+
     def test_parses_null_separated_output(self):
         output = (
-            "12345\x001700000000\x00/sdcard/DCIM/Camera/IMG.jpg\n"
-            "67890\x001700000001\x00/sdcard/DCIM/Camera/VID.mp4\n"
+            "12345\x001700000000\x00/sdcard/DCIM/Camera/IMG.jpg\x00"
+            "67890\x001700000001\x00/sdcard/DCIM/Camera/VID.mp4\x00"
         )
         stub = SubprocessStub()
         stub.respond(stdout="EXISTS")
@@ -669,7 +673,8 @@ class TestADBListFilesParsing:
             stub.restore()
 
     def test_nested_relpath(self):
-        output = "100\x001700000000\x00/sdcard/DCIM/Camera/sub/deep/IMG.jpg\n"
+        output = ("100\x001700000000\x00"
+                  "/sdcard/DCIM/Camera/sub/deep/IMG.jpg\x00")
         stub = SubprocessStub()
         stub.respond(stdout="EXISTS")
         stub.respond(stdout=output)
@@ -681,12 +686,43 @@ class TestADBListFilesParsing:
         finally:
             stub.restore()
 
-    def test_skips_malformed_lines(self):
+    def test_newline_in_filename(self):
+        """A filename containing a literal newline must parse as ONE file.
+
+        This is the bug the NUL record terminator fixes: with a '\\n'
+        terminator the record would split and the file would be lost or
+        truncated.
+        """
         output = (
-            "12345\x001700000000\x00/sdcard/DCIM/Camera/good.jpg\n"
-            "not_a_number\n"
-            "\n"
-            "bad\x00line\n"
+            "100\x001700000000\x00"
+            "/sdcard/DCIM/Camera/holiday\nphoto.jpg\x00"
+            "200\x001700000001\x00/sdcard/DCIM/Camera/normal.jpg\x00"
+        )
+        stub = SubprocessStub()
+        stub.respond(stdout="EXISTS")
+        stub.respond(stdout=output)
+        stub.install()
+        try:
+            adb = phonesync.ADB("SER")
+            files = adb.list_files_recursive("/sdcard/DCIM/Camera")
+            assert len(files) == 2
+            paths = {f["path"] for f in files}
+            assert "/sdcard/DCIM/Camera/holiday\nphoto.jpg" in paths
+            assert "/sdcard/DCIM/Camera/normal.jpg" in paths
+            # The newline-bearing file keeps its full name and basename
+            nl = [f for f in files if "\n" in f["path"]][0]
+            assert nl["name"] == "holiday\nphoto.jpg"
+            assert nl["size"] == 100
+        finally:
+            stub.restore()
+
+    def test_skips_malformed_trailing_fields(self):
+        """A trailing partial record (missing fields) is ignored, while the
+        complete records before it parse fine."""
+        output = (
+            "12345\x001700000000\x00/sdcard/DCIM/Camera/good.jpg\x00"
+            # dangling partial record: only one field, no terminator group
+            "not_a_number\x00"
         )
         stub = SubprocessStub()
         stub.respond(stdout="EXISTS")
@@ -697,6 +733,25 @@ class TestADBListFilesParsing:
             files = adb.list_files_recursive("/sdcard/DCIM/Camera")
             assert len(files) == 1
             assert files[0]["name"] == "good.jpg"
+        finally:
+            stub.restore()
+
+    def test_non_numeric_size_record_skipped(self):
+        """A record whose size/mtime aren't integers is skipped, not fatal."""
+        output = (
+            "xx\x00yy\x00/sdcard/DCIM/Camera/bad.jpg\x00"
+            "200\x001700000001\x00/sdcard/DCIM/Camera/ok.jpg\x00"
+        )
+        stub = SubprocessStub()
+        stub.respond(stdout="EXISTS")
+        stub.respond(stdout=output)
+        stub.install()
+        try:
+            adb = phonesync.ADB("SER")
+            files = adb.list_files_recursive("/sdcard/DCIM/Camera")
+            names = [f["name"] for f in files]
+            assert "ok.jpg" in names
+            assert "bad.jpg" not in names
         finally:
             stub.restore()
 
@@ -713,8 +768,8 @@ class TestADBListFilesParsing:
 
     def test_applies_file_exclusions(self):
         output = (
-            "100\x001700000000\x00/sdcard/DCIM/Camera/photo.jpg\n"
-            "50\x001700000000\x00/sdcard/DCIM/Camera/.nomedia\n"
+            "100\x001700000000\x00/sdcard/DCIM/Camera/photo.jpg\x00"
+            "50\x001700000000\x00/sdcard/DCIM/Camera/.nomedia\x00"
         )
         stub = SubprocessStub()
         stub.respond(stdout="EXISTS")
@@ -734,7 +789,7 @@ class TestADBListFilesParsing:
     def test_handles_pipe_in_filename(self):
         output = (
             "100\x001700000000\x00"
-            "/sdcard/DCIM/Camera/photo|vacation.jpg\n"
+            "/sdcard/DCIM/Camera/photo|vacation.jpg\x00"
         )
         stub = SubprocessStub()
         stub.respond(stdout="EXISTS")
@@ -750,7 +805,7 @@ class TestADBListFilesParsing:
 
     def test_list_files_wrapper(self):
         """list_files() should delegate to list_files_recursive(max_depth=1)."""
-        output = "100\x001700000000\x00/sdcard/DCIM/Camera/top.jpg\n"
+        output = "100\x001700000000\x00/sdcard/DCIM/Camera/top.jpg\x00"
         stub = SubprocessStub()
         stub.respond(stdout="EXISTS")
         stub.respond(stdout=output)
@@ -759,6 +814,87 @@ class TestADBListFilesParsing:
             adb = phonesync.ADB("SER")
             files = adb.list_files("/sdcard/DCIM/Camera")
             assert len(files) == 1
+        finally:
+            stub.restore()
+
+
+# ---------------------------------------------------------------------------
+# is_reachable() and scan-failure detection
+# ---------------------------------------------------------------------------
+
+class TestADBReachability:
+    def test_is_reachable_true(self):
+        stub = SubprocessStub().respond(stdout="__PS_OK__\n").install()
+        try:
+            adb = phonesync.ADB("SER")
+            assert adb.is_reachable() is True
+            assert stub.last_call == [
+                "adb", "-s", "SER", "shell", "echo __PS_OK__"]
+        finally:
+            stub.restore()
+
+    def test_is_reachable_false_on_error(self):
+        stub = SubprocessStub().respond(
+            returncode=1, stderr="device offline").install()
+        try:
+            adb = phonesync.ADB("SER")
+            assert adb.is_reachable() is False
+        finally:
+            stub.restore()
+
+    def test_is_reachable_false_on_garbage(self):
+        """If the echo doesn't come back intact, treat as unreachable."""
+        stub = SubprocessStub().respond(stdout="weird unrelated output\n")
+        stub.install()
+        try:
+            adb = phonesync.ADB("SER")
+            assert adb.is_reachable() is False
+        finally:
+            stub.restore()
+
+    def test_empty_existing_dir_reachable_returns_empty(self):
+        """Existing dir, no files, device reachable → empty list (no raise)."""
+        stub = SubprocessStub()
+        stub.respond(stdout="EXISTS")     # [ -d ] check
+        stub.respond(stdout="")           # find: no output
+        stub.respond(stdout="__PS_OK__")  # is_reachable probe
+        stub.install()
+        try:
+            adb = phonesync.ADB("SER")
+            files = adb.list_files_recursive("/sdcard/DCIM/Camera")
+            assert files == []
+        finally:
+            stub.restore()
+
+    def test_empty_existing_dir_unreachable_raises(self):
+        """Existing dir, no files, device UNREACHABLE → raise ADBError."""
+        stub = SubprocessStub()
+        stub.respond(stdout="EXISTS")   # [ -d ] check
+        stub.respond(stdout="")         # find: no output
+        stub.respond(returncode=1, stderr="offline")  # is_reachable fails
+        stub.install()
+        try:
+            adb = phonesync.ADB("SER")
+            raised = False
+            try:
+                adb.list_files_recursive("/sdcard/DCIM/Camera")
+            except phonesync.ADBError:
+                raised = True
+            assert raised
+        finally:
+            stub.restore()
+
+    def test_missing_dir_does_not_probe(self):
+        """A MISSING directory returns [] without a reachability probe."""
+        stub = SubprocessStub()
+        stub.respond(stdout="MISSING")  # [ -d ] check
+        stub.install()
+        try:
+            adb = phonesync.ADB("SER")
+            files = adb.list_files_recursive("/sdcard/NoDir")
+            assert files == []
+            # Only the [ -d ] check ran; no find, no probe.
+            assert len(stub.calls) == 1
         finally:
             stub.restore()
 
