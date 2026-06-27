@@ -122,6 +122,7 @@ def default_config(config_dir: str = None, data_dir: str = None):
         "recursive_scan": True,   # Scan subdirectories on phone
         "preserve_phone_subdirs": True,  # Maintain subdirectory structure from phone
         "verify_pulls": True,     # Hash-verify each pull against the phone
+        "use_library_index": True,  # Skip pulling content already in library
         "exclude_dirs": DEFAULT_EXCLUDE_DIRS,
         "exclude_files": DEFAULT_EXCLUDE_FILES,
         "followlinks": "Hardcoded_True",
@@ -859,6 +860,137 @@ def safe_filename(dest_dir: Path, name: str, device_name: str = "") -> Path:
 
 
 # ---------------------------------------------------------------------------
+# Library content index
+# ---------------------------------------------------------------------------
+
+class LibraryIndex:
+    """An on-disk content index of the data directory (the photo library).
+
+    Maps content hashes to the relpaths that hold that content, so the sync
+    engine can answer "is this content already in my library?" without
+    re-hashing the whole tree every run.
+
+    The library is SHARED across all devices, so the index is shared (one
+    cache file, not per-device).
+
+    A persistent cache keyed by (relpath -> {size, mtime, hash}) lets us
+    re-hash only files that are new or whose size/mtime changed. The cache
+    is advisory: a wrong cached hash can never cause data loss because the
+    engine still verifies content on the phone side before skipping a pull.
+    """
+
+    def __init__(self, data_dir: Path, cfg: dict):
+        self.data_dir = Path(data_dir)
+        self.cfg = cfg
+        self.cache_path = Path(cfg["config_dir"]) / "library-index.json"
+        # relpath -> {"size", "mtime", "hash"}
+        self._cache: dict = {}
+        # hash -> set(relpath)
+        self._by_hash: dict = {}
+        # sizes present on disk before this run (cheap pre-filter)
+        self._prerun_sizes: set = set()
+        # hashes present on disk before this run's ingest (frozen in build())
+        self._prerun_hashes: set = set()
+        self._loaded = False
+
+    def _load_cache(self):
+        if self.cache_path.exists():
+            try:
+                with open(self.cache_path) as f:
+                    data = json.load(f)
+                if isinstance(data, dict) and "files" in data:
+                    self._cache = data["files"]
+            except (json.JSONDecodeError, OSError):
+                # Corrupt cache is non-fatal: rebuild from scratch.
+                self._cache = {}
+
+    def _save_cache(self):
+        data = {"version": 1, "files": self._cache}
+        try:
+            _atomic_json_write(self.cache_path, data)
+        except OSError as e:
+            logging.warning(f"Could not save library index cache: {e}")
+
+    def build(self):
+        """Scan the library, hashing only new/changed files (per cache).
+
+        Populates the in-memory hash->relpaths map. Safe to call once per
+        run before the phases.
+        """
+        self._load_cache()
+        new_cache = {}
+        self._by_hash = {}
+
+        if self.data_dir.exists():
+            for root, dirs, files in os.walk(self.data_dir):
+                # Skip hidden dirs (e.g. .stversions, .git) for speed/safety
+                dirs[:] = [d for d in dirs if not d.startswith(".")]
+                for fname in files:
+                    fpath = Path(root) / fname
+                    try:
+                        st = fpath.stat()
+                    except OSError:
+                        continue
+                    relpath = str(fpath.relative_to(self.data_dir))
+                    size = st.st_size
+                    mtime = int(st.st_mtime)
+
+                    cached = self._cache.get(relpath)
+                    if (cached and cached.get("size") == size
+                            and cached.get("mtime") == mtime
+                            and cached.get("hash")):
+                        h = cached["hash"]
+                    else:
+                        try:
+                            h = file_sha256(str(fpath))
+                        except OSError:
+                            continue
+                    new_cache[relpath] = {
+                        "size": size, "mtime": mtime, "hash": h}
+                    self._by_hash.setdefault(h, set()).add(relpath)
+
+        self._cache = new_cache
+        self._loaded = True
+        # Freeze the set of hashes present BEFORE this run's ingest begins.
+        # The library-skip uses this so that two identical files pulled
+        # within the SAME run don't suppress each other (which would break
+        # keep_duplicates=true); only content already on disk before the run
+        # suppresses a re-pull.
+        self._prerun_hashes = set(self._by_hash.keys())
+        self._prerun_sizes = {
+            v["size"] for v in self._cache.values() if "size" in v}
+        self._save_cache()
+
+    def contains_hash(self, file_hash: str) -> bool:
+        return file_hash in self._by_hash and bool(self._by_hash[file_hash])
+
+    def contains_hash_prerun(self, file_hash: str) -> bool:
+        """True if this hash existed on disk before the run's ingest began."""
+        return file_hash in self._prerun_hashes
+
+    def maybe_prerun_size(self, size: int) -> bool:
+        """Cheap pre-filter: could any pre-run file have this size? If not,
+        the content definitely isn't in the library and we can skip hashing
+        the phone file."""
+        return size in self._prerun_sizes
+
+    def paths_for_hash(self, file_hash: str) -> list:
+        return sorted(self._by_hash.get(file_hash, set()))
+
+    def add(self, relpath: str, file_hash: str, size: int, mtime: int):
+        """Register a newly-written file in the in-memory index + cache."""
+        self._by_hash.setdefault(file_hash, set()).add(relpath)
+        self._cache[relpath] = {
+            "size": size, "mtime": mtime, "hash": file_hash}
+
+    def remove_relpath(self, relpath: str):
+        """Drop a relpath from the index (e.g. after it's moved/deleted)."""
+        info = self._cache.pop(relpath, None)
+        if info and info.get("hash") in self._by_hash:
+            self._by_hash[info["hash"]].discard(relpath)
+
+
+# ---------------------------------------------------------------------------
 # Core Sync Engine
 # ---------------------------------------------------------------------------
 
@@ -888,11 +1020,14 @@ class SyncEngine:
             "errors": 0,
             "pull_verify_failures": 0,  # pulls that failed hash verification
             "partial_moves": 0,     # dest written but source not removed
+            "library_skipped": 0,   # already present in library, not pulled
             "bytes_copied": 0,
         }
         self.discovered_subdirs = []
         self.deleted_files = []  # [(relpath, category)] for deletion report
         self._scan_failed = False
+        # Shared on-disk content index of the library (built in run()).
+        self.library = LibraryIndex(self.data_dir, cfg)
         # Relpaths whose phone_path was updated by phone-side move detection
         # in the current run. Phase 3 must not immediately "repair" those
         # back to the computer-derived desired phone path.
@@ -1046,6 +1181,15 @@ class SyncEngine:
             self._scan_failed = True
             return False
 
+        # Build the shared library content index once, before the phases.
+        # Lets ingest skip pulling content that's already in the library
+        # (first run against an existing library, and partial-move dups).
+        if self.cfg.get("use_library_index", True):
+            logging.info("=== Indexing library ===")
+            self.library.build()
+            logging.info(
+                f"    Indexed {len(self.library._cache)} library files")
+
         # Phase 1: Detect phone-side moves (must happen before ingest
         # so moved files aren't re-ingested as new)
         self._phase_detect_phone_moves()
@@ -1058,6 +1202,11 @@ class SyncEngine:
 
         if not self.dry_run:
             self.state.save()
+            # Persist the library cache including files this run pulled, so
+            # the next run doesn't have to re-hash them. (build() saved the
+            # pre-ingest snapshot; this captures additions from ingest.)
+            if self.cfg.get("use_library_index", True):
+                self.library._save_cache()
 
         self._print_summary()
         return True
@@ -1376,6 +1525,66 @@ class SyncEngine:
                 self.stats["files_copied"] += 1
                 continue
 
+            # Library skip (#8/#14): for a genuinely-new file (not tracked
+            # by phone_path), if its content already exists in the library
+            # from BEFORE this run, we may be able to avoid re-pulling it.
+            #
+            # Scope (chosen carefully to respect keep_duplicates):
+            #  - keep_duplicates FALSE: dedup is the whole point — if the
+            #    content is already on disk, skip the pull.
+            #  - keep_duplicates TRUE: only skip when this untracked phone
+            #    file is the DESTINATION a tracked file is moving to (its
+            #    desired phone path), i.e. a partial-move completion (#14).
+            #    A genuinely new independent duplicate the user created on
+            #    the phone is still pulled (keep_duplicates honored), as is
+            #    the same photo arriving from a different device.
+            #
+            # We always get the phone's own hash first; if we can't, fall
+            # through to a normal pull (never skip on uncertainty).
+            if (not existing and not self.dry_run
+                    and self.cfg.get("use_library_index", True)
+                    and self.library.maybe_prerun_size(size)):
+                phone_hash = self.adb.file_hash(phone_path)
+                if phone_hash and self.library.contains_hash_prerun(
+                        phone_hash):
+                    lib_paths = self.library.paths_for_hash(phone_hash)
+                    keep_duplicates = self.cfg.get("keep_duplicates", True)
+
+                    adopt_relpath = None
+                    if not keep_duplicates and lib_paths:
+                        adopt_relpath = lib_paths[0]
+                    else:
+                        # keep_duplicates: only adopt if this phone_path is
+                        # the move destination of a tracked same-device entry
+                        # whose content matches (partial-move completion).
+                        for lp in lib_paths:
+                            e = self.state.files.get(lp)
+                            if not e or e.get("device_name") != \
+                                    self.device_name:
+                                continue
+                            desired = self._compute_desired_phone_path(
+                                self.data_dir / lp, e)
+                            if desired == phone_path:
+                                adopt_relpath = lp
+                                break
+
+                    if adopt_relpath is not None:
+                        existing_entry = self.state.files.get(adopt_relpath)
+                        owner = (existing_entry or {}).get("device_name")
+                        if existing_entry is None or \
+                                owner == self.device_name:
+                            mtime_iso = datetime.fromtimestamp(
+                                finfo["mtime_epoch"]).isoformat()
+                            self.state.add_file(
+                                adopt_relpath, phone_path, phone_hash,
+                                size, mtime_iso, category,
+                                phone_source_dir=phone_dir)
+                            logging.info(
+                                f"  Already in library, not pulling: "
+                                f"{phone_path} -> {adopt_relpath}")
+                            self.stats["library_skipped"] += 1
+                            continue
+
             logging.info(f"  {'Re-pulling' if existing else 'Copying'}: "
                          f"{phone_path} ({_human_size(size)})")
             if not self.adb.pull(phone_path, str(tmp_path)):
@@ -1507,6 +1716,14 @@ class SyncEngine:
             self.state.add_file(
                 relpath, phone_path, local_hash, size, mtime_iso, category,
                 phone_source_dir=phone_dir)
+            # Keep the live index current (do NOT add to the pre-run set, so
+            # same-run duplicates still follow keep_duplicates semantics).
+            try:
+                self.library.add(
+                    relpath, local_hash, size,
+                    int(dest_path.stat().st_mtime))
+            except OSError:
+                pass
 
             self.stats["files_copied"] += 1
             self.stats["bytes_copied"] += size
@@ -1804,6 +2021,9 @@ class SyncEngine:
         prefix = "[DRY RUN] " if self.dry_run else ""
         print(f"\n{prefix}Sync complete for {self.device_name}:")
         print(f"  Files copied:     {s['files_copied']}")
+        if s["library_skipped"]:
+            print(f"  Already in library: {s['library_skipped']} "
+                  f"(content present, not pulled)")
         if s["files_updated"]:
             print(f"  Files updated:    {s['files_updated']} "
                   f"(re-pulled, mtime changed)")

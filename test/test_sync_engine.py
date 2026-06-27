@@ -443,6 +443,136 @@ class TestMoveCandidateDisambiguation:
 
 
 # ---------------------------------------------------------------------------
+# Library index skip (#8): don't re-pull content already in the library
+# ---------------------------------------------------------------------------
+
+class TestLibrarySkip:
+    def test_first_run_skips_existing_content_dedup(self, harness):
+        """keep_duplicates=False: a phone file whose content already sits in
+        the library (e.g. from a prior manual copy) is not pulled again."""
+        cfg = phonesync.load_config()
+        cfg["keep_duplicates"] = False
+        phonesync.save_config(cfg)
+
+        content = b"ALREADY_IN_LIBRARY_XYZ"
+        # Pre-seed the library on disk, as if from a previous tool/run.
+        harness.computer_write("photos/2025/existing.jpg", content,
+                               mtime=1736899200.0)
+        # The same content sits on the phone at an untracked path.
+        harness.phone_write("a", "DCIM/Camera/existing.jpg", content,
+                            1736899200.0)
+
+        engine = harness.sync("a")
+        assert engine.stats["library_skipped"] == 1
+        assert engine.stats["files_copied"] == 0
+        # No second physical copy was created.
+        photos = harness.computer_list("photos")
+        assert photos.count("photos/2025/existing.jpg") == 1
+        assert len(photos) == 1
+
+    def test_skip_records_state_pointing_at_library_copy(self, harness):
+        """The skipped file is tracked in state, pointing at the existing
+        library relpath, so future syncs treat it as known."""
+        cfg = phonesync.load_config()
+        cfg["keep_duplicates"] = False
+        phonesync.save_config(cfg)
+
+        content = b"LIB_CONTENT_TRACK"
+        harness.computer_write("photos/2025/lib.jpg", content,
+                               mtime=1736899200.0)
+        harness.phone_write("a", "DCIM/Camera/lib.jpg", content,
+                            1736899200.0)
+        harness.sync("a")
+
+        state = harness.get_state("a")["files"]
+        assert "photos/2025/lib.jpg" in state
+        assert state["photos/2025/lib.jpg"]["phone_path"] == \
+            "/sdcard/DCIM/Camera/lib.jpg"
+
+    def test_new_content_still_pulled(self, harness):
+        """Content NOT already in the library is pulled normally."""
+        cfg = phonesync.load_config()
+        cfg["keep_duplicates"] = False
+        phonesync.save_config(cfg)
+
+        harness.computer_write("photos/2025/old.jpg", b"OLD",
+                               mtime=1736899200.0)
+        # A different, genuinely new file on the phone.
+        harness.phone_write("a", "DCIM/Camera/new.jpg", b"BRAND_NEW",
+                            1736899200.0)
+        engine = harness.sync("a")
+        assert engine.stats["files_copied"] == 1
+        assert engine.stats["library_skipped"] == 0
+
+    def test_size_prefilter_avoids_hash_when_no_size_match(self, harness):
+        """If no library file shares the phone file's size, the engine does
+        not even ask the phone for a hash (the cheap pre-filter short-
+        circuits)."""
+        from conftest import FakeADB
+        cfg = phonesync.load_config()
+        cfg["keep_duplicates"] = False
+        phonesync.save_config(cfg)
+
+        harness.computer_write("photos/2025/big.jpg", b"X" * 500,
+                               mtime=1736899200.0)
+        harness.phone_write("a", "DCIM/Camera/small.jpg", b"tiny",
+                            1736899200.0)
+
+        calls = {"n": 0}
+        orig = FakeADB.file_hash
+
+        def counting(self, p):
+            calls["n"] += 1
+            return orig(self, p)
+
+        FakeADB.file_hash = counting
+        try:
+            harness.sync("a")
+        finally:
+            FakeADB.file_hash = orig
+        # The new small.jpg has a unique size, so no library-skip hash probe
+        # happened for it. (verify_pulls is off by default? it's on — but
+        # that hashes AFTER pull. The pre-pull library probe is what we're
+        # asserting didn't fire, so calls come only from pull verification.)
+        # With a unique size, the pre-filter prevents the pre-pull probe;
+        # the post-pull verify still hashes once.
+        assert calls["n"] <= 1
+
+    def test_disabled_index_pulls_everything(self, harness):
+        """With use_library_index=false, existing content is pulled again."""
+        cfg = phonesync.load_config()
+        cfg["keep_duplicates"] = False
+        cfg["use_library_index"] = False
+        phonesync.save_config(cfg)
+
+        content = b"DUP_WHEN_INDEX_OFF"
+        harness.computer_write("photos/2025/existing.jpg", content,
+                               mtime=1736899200.0)
+        harness.phone_write("a", "DCIM/Camera/existing.jpg", content,
+                            1736899200.0)
+        engine = harness.sync("a")
+        # Index off → no skip. With keep_duplicates=false the post-pull
+        # dedup still prevents a second copy, but library_skipped stays 0.
+        assert engine.stats["library_skipped"] == 0
+
+    def test_cache_persists_this_run_pulls(self, harness):
+        """Files pulled during a run are written to the shared cache, so the
+        next run does not re-hash them."""
+        import json
+        harness.phone_write("a", "DCIM/Camera/x.jpg", b"PULLED_CONTENT",
+                            1736899200.0)
+        harness.sync("a")
+        cache_file = harness.cfg_dir / "library-index.json"
+        assert cache_file.exists()
+        with open(cache_file) as f:
+            cached = json.load(f)
+        # The pulled file is present in the persisted cache.
+        assert "photos/2025/x.jpg" in cached["files"]
+        assert cached["files"]["photos/2025/x.jpg"]["hash"] == \
+            __import__("hashlib").sha256(b"PULLED_CONTENT").hexdigest()
+
+
+# ---------------------------------------------------------------------------
 # Ingest phase — edge cases
 # ---------------------------------------------------------------------------
 
@@ -1141,14 +1271,11 @@ class TestPartialPhoneMove:
         assert engine.stats["errors"] >= 1
 
     def test_partial_move_no_duplicate_reingest(self, harness, img_data):
-        """KNOWN DEFECT (TODO #14): after a partial move, the destination
-        file written on the phone is untracked, so the NEXT sync's ingest
-        pass pulls it as a new file before phase 3 completes the move —
-        creating a duplicate on the computer.
-
-        This test documents the current (incorrect) behavior so the bug is
-        visible and pinned. When TODO #14 is fixed, flip the assertions to
-        require files_after == files_before and no duplicate suffix.
+        """After a partial move, the destination file written on the phone
+        is untracked by phone_path, but its CONTENT is already in the
+        library and tracked by this device. The library index recognizes it
+        and skips the re-pull, so NO duplicate is created on the next sync.
+        (TODO #14, fixed by the library index.)
         """
         c, m = img_data("p", 2025, 1, 15)
         harness.phone_write("a", "DCIM/Camera/IMG_20250115_001.jpg", c, m)
@@ -1159,15 +1286,15 @@ class TestPartialPhoneMove:
         harness.sync("a", adb_cls=self._partial_move_adb())
 
         files_before = set(harness.computer_list("photos"))
-        harness.sync("a")  # clean sync completes the move
+        engine = harness.sync("a")  # clean sync completes the move
         files_after = set(harness.computer_list("photos"))
 
-        # CURRENT behavior: a duplicate is created (documents the defect).
-        new_files = files_after - files_before
-        assert len(new_files) == 1
-        assert any("_phone-a" in f for f in new_files), (
-            "expected the known duplicate suffix; if this fails the bug "
-            "may be fixed — see TODO #14 and update this test")
+        # FIXED behavior: no duplicate is created.
+        assert files_after == files_before
+        # No "_phone-a" suffixed duplicate exists.
+        assert not any("_phone-a" in f for f in files_after)
+        # The re-pull was avoided via the library index.
+        assert engine.stats["library_skipped"] >= 1
 
 
 # ---------------------------------------------------------------------------
