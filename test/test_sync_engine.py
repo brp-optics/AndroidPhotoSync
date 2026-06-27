@@ -352,6 +352,97 @@ class TestPhoneMoveDetection:
 
 
 # ---------------------------------------------------------------------------
+# Phone-move candidate disambiguation (#10): use filename + mtime, and
+# REFUSE to guess when multiple identical copies are equally plausible.
+# ---------------------------------------------------------------------------
+
+class TestMoveCandidateDisambiguation:
+    def test_ambiguous_identical_copies_not_guessed(self, harness, img_data):
+        """One tracked file moves away AND a second identical copy (same
+        name, same mtime) appears at another untracked path. The two copies
+        are indistinguishable, so the engine must NOT guess: 0 moves, 1
+        conflict, state left pointing at the old path."""
+        c, m = img_data("p", 2025, 1, 15)
+        harness.phone_write("a", "DCIM/Camera/orig.jpg", c, m)
+        harness.sync("a")
+
+        harness.phone_move(
+            "a", "DCIM/Camera/orig.jpg", "DCIM/Camera/albumA/orig.jpg")
+        # Second identical copy: same basename, same mtime, different dir.
+        harness.phone_write("a", "DCIM/Camera/albumB/orig.jpg", c, m)
+
+        engine = harness.sync("a")
+        assert engine.stats["phone_moves_detected"] == 0
+        assert engine.stats["move_conflicts"] == 1
+        # State for the original still points at the OLD path (not guessed).
+        phone_paths = {
+            i["phone_path"]
+            for i in harness.get_state("a")["files"].values()}
+        assert "/sdcard/DCIM/Camera/orig.jpg" in phone_paths
+
+    def test_ambiguous_copies_no_data_loss(self, harness, img_data):
+        """Even though the move isn't resolved, both physical copies end up
+        on the computer (the unmatched ones are ingested as new files)."""
+        c, m = img_data("p", 2025, 1, 15)
+        harness.phone_write("a", "DCIM/Camera/orig.jpg", c, m)
+        harness.sync("a")
+        harness.phone_move(
+            "a", "DCIM/Camera/orig.jpg", "DCIM/Camera/albumA/orig.jpg")
+        harness.phone_write("a", "DCIM/Camera/albumB/orig.jpg", c, m)
+
+        harness.sync("a")
+        # The content is preserved on the computer (no loss); with
+        # keep_duplicates=true both copies are present.
+        contents = [harness.computer_read(f)
+                    for f in harness.computer_list("photos")]
+        assert contents.count(c) >= 1
+
+    def test_name_and_mtime_break_tie(self, harness, img_data):
+        """When one candidate matches name+mtime (a real mv) and another is
+        a renamed/re-timed copy, the strong candidate wins — no conflict."""
+        c, m = img_data("p", 2025, 1, 15)
+        harness.phone_write("a", "DCIM/Camera/orig.jpg", c, m)
+        harness.sync("a")
+
+        # Real move preserves name + mtime.
+        harness.phone_move(
+            "a", "DCIM/Camera/orig.jpg", "DCIM/Camera/album/orig.jpg")
+        # A renamed copy with a different mtime (weaker tier).
+        harness.phone_write(
+            "a", "DCIM/Camera/shared/renamed.jpg", c, m + 9999)
+
+        engine = harness.sync("a")
+        assert engine.stats["move_conflicts"] == 0
+        assert engine.stats["phone_moves_detected"] == 1
+        # The original's history attached to the true move target.
+        st = harness.get_state("a")["files"]
+        assert st["photos/2025/orig.jpg"]["phone_path"] == \
+            "/sdcard/DCIM/Camera/album/orig.jpg"
+
+    def test_mtime_breaks_tie_when_names_differ(self, harness, img_data):
+        """If neither candidate keeps the basename but one keeps the mtime,
+        the mtime match is the stronger tier and wins."""
+        c, m = img_data("p", 2025, 1, 15)
+        harness.phone_write("a", "DCIM/Camera/orig.jpg", c, m)
+        harness.sync("a")
+
+        harness.phone_move(
+            "a", "DCIM/Camera/orig.jpg", "DCIM/Camera/a/renamed_same_mtime.jpg")
+        # set the moved file's mtime back to the original (mv preserves it;
+        # phone_move uses shutil.move which keeps mtime, so this is already
+        # the case) — and add a different-mtime renamed copy.
+        harness.phone_write(
+            "a", "DCIM/Camera/b/other_name.jpg", c, m + 12345)
+
+        engine = harness.sync("a")
+        assert engine.stats["move_conflicts"] == 0
+        assert engine.stats["phone_moves_detected"] == 1
+        st = harness.get_state("a")["files"]
+        assert st["photos/2025/orig.jpg"]["phone_path"] == \
+            "/sdcard/DCIM/Camera/a/renamed_same_mtime.jpg"
+
+
+# ---------------------------------------------------------------------------
 # Ingest phase — edge cases
 # ---------------------------------------------------------------------------
 

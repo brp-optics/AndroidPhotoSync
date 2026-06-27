@@ -883,6 +883,7 @@ class SyncEngine:
             "duplicates_skipped": 0,  # keep_duplicates=false re-pulls
             "moves_synced": 0,
             "phone_moves_detected": 0,
+            "move_conflicts": 0,    # ambiguous move targets, not guessed
             "local_deletions": 0,   # files missing from computer
             "errors": 0,
             "pull_verify_failures": 0,  # pulls that failed hash verification
@@ -1174,23 +1175,37 @@ class SyncEngine:
                     # and search for our file elsewhere by hash.
 
             # File is gone from (or displaced at) its expected phone path.
-            # Search for it at a new path by size + hash.
-            new_phone_path = None
+            # Search for it at a new path by size + hash. There may be more
+            # than one untracked copy with identical content; in that case we
+            # must NOT pick arbitrarily. Collect all candidates, then use the
+            # free signals we already scanned (basename + mtime) to break the
+            # tie. mv preserves both name and mtime, whereas a copy/re-export
+            # usually changes at least one. If the best tier still has more
+            # than one candidate, we refuse to guess and flag a conflict.
+            old_basename = os.path.basename(old_phone_path)
+            tracked_mtime = info.get("phone_mtime", "")
 
+            candidates = []
             for ppath, pinfo in self._phone_path_index.items():
-                # The old path can't be the move target if a different
-                # file now occupies it.
                 if ppath == old_phone_path:
                     continue
-                # Skip paths already tracked by another state entry
                 if ppath in tracked_phone_paths and ppath != old_phone_path:
                     continue
                 if pinfo["size"] != expected_size:
                     continue
                 phone_hash = self.adb.file_hash(ppath)
                 if phone_hash == file_hash:
-                    new_phone_path = ppath
-                    break
+                    cand_mtime = datetime.fromtimestamp(
+                        pinfo["mtime_epoch"]).isoformat()
+                    candidates.append({
+                        "path": ppath,
+                        "name_match": os.path.basename(ppath) == old_basename,
+                        "mtime_match": bool(tracked_mtime)
+                        and cand_mtime == tracked_mtime,
+                    })
+
+            new_phone_path = self._choose_move_target(
+                old_phone_path, candidates)
 
             if new_phone_path:
                 logging.info(
@@ -1212,6 +1227,57 @@ class SyncEngine:
                 self.stats["phone_moves_detected"] += 1
             # else: file deleted from phone — that's fine, we keep it on
             # computer (safe delete behavior)
+
+    def _choose_move_target(self, old_phone_path: str,
+                            candidates: list[dict]) -> Optional[str]:
+        """Pick the single best move target from same-content candidates.
+
+        candidates: [{"path", "name_match", "mtime_match"}, ...]
+
+        Ranking tiers (a real `mv` preserves both basename and mtime; a
+        copy/re-export usually changes at least one):
+            tier 0: name_match AND mtime_match   (strongest)
+            tier 1: name_match XOR mtime_match
+            tier 2: neither                       (weakest)
+
+        We take the best non-empty tier. If exactly one candidate sits in
+        it, that's the move. If more than one candidate is tied in the best
+        tier, the evidence is genuinely ambiguous — we REFUSE to guess,
+        log a conflict, and return None (leaving state pointing at the old
+        path). The user can resolve it. Returning None here is the safe
+        outcome: at worst the extra copies are ingested as new files
+        (no data loss), rather than silently attaching the original's
+        history to an arbitrary copy.
+        """
+        if not candidates:
+            return None
+
+        def tier(c):
+            if c["name_match"] and c["mtime_match"]:
+                return 0
+            if c["name_match"] or c["mtime_match"]:
+                return 1
+            return 2
+
+        best_tier = min(tier(c) for c in candidates)
+        best = [c for c in candidates if tier(c) == best_tier]
+
+        if len(best) == 1:
+            return best[0]["path"]
+
+        # Ambiguous: multiple indistinguishable candidates in the best tier.
+        logging.warning(
+            f"  Move CONFLICT for {old_phone_path}: {len(best)} untracked "
+            f"copies have identical content and equally-strong evidence "
+            f"(name/mtime). Not guessing which is the move; leaving state "
+            f"unchanged. Candidates:")
+        for c in best:
+            logging.warning(
+                f"    - {c['path']} "
+                f"(name_match={c['name_match']}, "
+                f"mtime_match={c['mtime_match']})")
+        self.stats["move_conflicts"] += 1
+        return None
 
     def _phase_ingest(self):
         """Phase 2: Ingest genuinely new files from phone.
@@ -1755,6 +1821,9 @@ class SyncEngine:
                       f"keep_duplicates=true to avoid repeated transfers.")
         if s["phone_moves_detected"]:
             print(f"  Phone moves:      {s['phone_moves_detected']}")
+        if s["move_conflicts"]:
+            print(f"  ⚠ Move conflicts: {s['move_conflicts']} "
+                  f"(ambiguous identical copies; not guessed — see log)")
         print(f"  Moves synced:     {s['moves_synced']}")
         print(f"  Errors:           {s['errors']}")
         if s["pull_verify_failures"]:
