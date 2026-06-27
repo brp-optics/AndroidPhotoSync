@@ -860,6 +860,10 @@ class SyncEngine:
         }
         self.discovered_subdirs = []
         self.deleted_files = []  # [(relpath, category)] for deletion report
+        # Relpaths whose phone_path was updated by phone-side move detection
+        # in the current run. Phase 3 must not immediately "repair" those
+        # back to the computer-derived desired phone path.
+        self._phone_moved_relpaths = set()
 
     def _resolve_device_name(self) -> str:
         devices_cfg = self.cfg.get("devices", {})
@@ -1064,6 +1068,10 @@ class SyncEngine:
         file that happens to have the same content.
         """
         logging.info("=== Phase 1: Detecting phone-side moves ===")
+        # Track moves detected in this run so Phase 3 does not immediately
+        # undo a user-initiated phone-side move by recomputing the desired
+        # phone path from the unchanged computer path.
+        self._phone_moved_relpaths = set()
         sources = self._get_sources()
 
         # Build set of all phone_paths currently tracked in state,
@@ -1134,6 +1142,7 @@ class SyncEngine:
                     f"  Phone-side move detected: "
                     f"{old_phone_path} -> {new_phone_path}")
                 self.state.files[relpath]["phone_path"] = new_phone_path
+                self._phone_moved_relpaths.add(relpath)
                 # Update tracked set
                 tracked_phone_paths.discard(old_phone_path)
                 tracked_phone_paths.add(new_phone_path)
@@ -1463,6 +1472,8 @@ class SyncEngine:
         # on the computer but whose phone path might be stale (e.g. from
         # a previous failed move)
         for relpath, info in list(self.state.files.items()):
+            if relpath in self._phone_moved_relpaths:
+                continue
             if info.get("device_name") != self.device_name:
                 continue
             if info.get("deleted_from_computer"):
