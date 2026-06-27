@@ -1,0 +1,35 @@
+[Unit]
+Description=PhoneSync - ingest photos/downloads/recordings from an Android phone
+Documentation=https://github.com/user/phonesync
+After=network.target
+
+[Service]
+Type=oneshot
+
+# Installed by install.sh --with-service, which substitutes the real values.
+# Runs as your login user so it can reach your ~/PhoneSync and ~/.phonesync.
+User=CHANGE_ME
+Group=CHANGE_ME
+Environment=HOME=/home/CHANGE_ME
+Environment=PATH=/usr/local/bin:/home/CHANGE_ME/.local/bin:/usr/bin:/bin
+
+# Give ADB a moment to enumerate the device after the USB 'add' event.
+ExecStartPre=/bin/sleep 8
+
+# Run the sync via uv against the installed project. Unattended runs only
+# touch devices you've approved (phonesync devices --approve <SERIAL>); an
+# unapproved device is skipped, not synced — this scopes the auto-sync.
+ExecStart=@UV_BIN@ run --project @INSTALL_DIR@ @INSTALL_DIR@/phonesync.py sync
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=phonesync
+
+# One-shot triggered by udev; don't auto-restart.
+Restart=no
+
+# Allow time for a large first sync, but not unbounded.
+TimeoutStartSec=1800
+
+[Install]
+WantedBy=multi-user.target

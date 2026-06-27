@@ -1,13 +1,14 @@
 [project]
 name = "phonesync"
-version = "0.1.0"
+version = "0.6.0"
 description = "A CLI tool for sync of photos, downloads, and recordings from Android phone(s) to Linux via ADB."
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = [
-    "pillow",
-]
- 
+dependencies = []
+
+[project.optional-dependencies]
+exif = ["pillow"]
+
 [tool.pytest.ini_options]
 testpaths = ["test"]
 addopts = "-v --tb=short"
@@ -15,6 +16,7 @@ addopts = "-v --tb=short"
 [dependency-groups]
 dev = [
     "pytest>=8.0",
+    "pillow"
 ]
  
 

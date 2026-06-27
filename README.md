@@ -41,7 +41,7 @@ uv run phonesync.py sync --dry-run     # preview what would be synced
 uv run phonesync.py sync               # do it for real
 ```
 
-> The examples above invoke `phonesync.py` directly with `uv run`. If you put the script on your `PATH` as `phonesync`, drop the `uv run` prefix and the `.py`.
+> The examples above invoke `phonesync.py` directly with `uv run`. To get a real `phonesync` command on your `PATH` (so you can drop the `uv run` prefix and the `.py`), run `./contrib/install.sh` — it installs the project with uv and drops a launcher at `/usr/local/bin/phonesync`. Add `--with-service` to also set up the experimental auto-sync (see [Planned](#planned--not-yet-implemented)).
 
 ## Directory Structure
 
@@ -237,7 +237,49 @@ The tests use a local-filesystem fake for ADB, so no phone is needed. The runner
 
 These are described here as goals, not current behavior:
 
-- **Auto-sync on plug-in** — a udev rule + systemd service to run `sync` automatically when a phone is connected. (No installer, udev rule, or service unit ships today; run `sync` manually for now.) The approved-devices registry already provides the key safety scoping: an unattended sync only touches devices you've approved with `phonesync devices --approve`.
+- **Auto-sync on plug-in** — a udev rule + systemd service to run `sync` automatically when a phone is connected. An **experimental** uv-based installer ships in `contrib/` (`./contrib/install.sh --with-service`); it installs the launcher, a systemd unit, and a udev rule. It's opt-in and still rough. The approved-devices registry provides the key safety scoping regardless: an unattended sync only touches devices you've approved with `phonesync devices --approve`, so an unknown phone plugged in is skipped, not synced. Setup is manual — see below.
+
+### Setting up auto-sync (experimental)
+
+The udev rule does **not** match all phones by default — that would let a sync fire on any Android device anyone plugs in. You scope it to your own phone. Steps:
+
+1. **Install with the service:**
+   ```bash
+   ./contrib/install.sh --with-service
+   ```
+   This installs the launcher, the systemd unit, and `/etc/udev/rules.d/99-phonesync.rules` — but every match line in that rule starts out commented, so nothing triggers yet.
+
+2. **Approve the phone** (so an unattended sync is allowed to touch it at all):
+   ```bash
+   phonesync devices                 # lists each connected device's serial + approval status
+   phonesync devices --approve SERIAL
+   ```
+
+3. **Find the phone's USB serial.** This is the `iSerial` the udev rule matches on (usually the same string shown by `phonesync devices`, but confirm at the USB layer):
+   ```bash
+   lsusb                             # find your phone's "Bus 00X Device 0YY: ID vvvv:pppp"
+   udevadm info -a -n /dev/bus/usb/00X/0YY | grep -m1 ATTRS{serial}
+   ```
+   The `ID vvvv:pppp` part is the vendor:product (`idVendor`:`idProduct`); the `ATTRS{serial}` line is the USB serial.
+
+4. **Edit the rule** at `/etc/udev/rules.d/99-phonesync.rules`. Uncomment the serial line and fill in your value (preferred — most specific):
+   ```
+   ACTION=="add", SUBSYSTEM=="usb", ATTRS{serial}=="YOUR_PHONE_SERIAL", TAG+="systemd", ENV{SYSTEMD_WANTS}="phonesync.service"
+   ```
+   If your phone doesn't expose a stable USB serial, uncomment the vendor+product line instead (matches every unit of that exact model, still far narrower than vendor-only):
+   ```
+   ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="18d1", ATTR{idProduct}=="YOUR_PRODUCT_ID", TAG+="systemd", ENV{SYSTEMD_WANTS}="phonesync.service"
+   ```
+
+5. **Reload udev and test:**
+   ```bash
+   sudo udevadm control --reload-rules
+   udevadm monitor --subsystem-match=usb   # then plug in the phone and watch
+   journalctl -u phonesync -f               # follow the sync's logs
+   ```
+
+Notes: the rule matches on the **USB hardware serial**, which is set by `--approve` independently — they're separate lists, so a device must be in *both* (udev rule + approved registry) for an unattended sync to run. Multiple phones each need their own uncommented match line. The first sync of a device still has to be done by hand (an unapproved device is refused non-interactively), so approve and do one manual `phonesync sync` before relying on auto-sync.
+
 - **`phonesync doctor`** — verify that the phone's `find`/`stat`/`printf` scan command behaves as expected on the device's toybox before trusting a large sync.
 - The reserved config keys listed above.
 

@@ -44,20 +44,26 @@ wheels = [
 name = "phonesync"
 version = "0.1.0"
 source = { virtual = "." }
-dependencies = [
+
+[package.optional-dependencies]
+exif = [
     { name = "pillow" },
 ]
 
 [package.dev-dependencies]
 dev = [
+    { name = "pillow" },
     { name = "pytest" },
 ]
 
 [package.metadata]
-requires-dist = [{ name = "pillow" }]
+requires-dist = [{ name = "pillow", marker = "extra == 'exif'" }]
 
 [package.metadata.requires-dev]
-dev = [{ name = "pytest", specifier = ">=8.0" }]
+dev = [
+    { name = "pillow" },
+    { name = "pytest", specifier = ">=8.0" },
+]
 
 [[package]]
 name = "pillow"

@@ -1,0 +1,36 @@
+# /etc/udev/rules.d/99-phonesync.rules
+#
+# Trigger phonesync.service when YOUR Android phone is connected via USB.
+#
+# IMPORTANT: by design this file does NOT match all Android devices. A rule
+# that fires on any plugged-in phone could kick off a sync against a device
+# that isn't yours. Scope it to your specific phone instead.
+#
+# Two layers of protection are in play:
+#   1. This udev rule should match only your device(s) (see below).
+#   2. Even if the service is triggered, `phonesync sync` run unattended only
+#      touches devices you've approved with `phonesync devices --approve`.
+#      An unapproved device is skipped. So forgetting to scope this rule is
+#      not catastrophic — but scope it anyway.
+#
+# ── How to scope to your phone ───────────────────────────────────────────────
+# Find your phone's USB serial (the iSerial / ATTRS{serial} value):
+#     lsusb                                  # find the Bus/Device + idVendor
+#     udevadm info -a -n /dev/bus/usb/<BUS>/<DEV> | grep -m1 ATTRS{serial}
+# Note: this USB iSerial is the hardware serial; the ADB serial shown by
+# `phonesync devices` is usually the same, but confirm with the command above.
+#
+# Then uncomment ONE of the lines below and fill in your value(s):
+
+# -- Preferred: match a single device by its USB serial --------------------
+#ACTION=="add", SUBSYSTEM=="usb", ATTRS{serial}=="YOUR_PHONE_SERIAL", TAG+="systemd", ENV{SYSTEMD_WANTS}="phonesync.service"
+
+# -- Or: match your phone's vendor:product (less specific — matches every
+#    device of that exact model, but still far narrower than vendor-only) ---
+#ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="18d1", ATTR{idProduct}=="YOUR_PRODUCT_ID", TAG+="systemd", ENV{SYSTEMD_WANTS}="phonesync.service"
+#
+# Find idVendor/idProduct with: lsusb   (shows them as VVVV:PPPP)
+#
+# Common Android vendor IDs (for reference only — do NOT match on vendor alone):
+#   Google/Pixel 18d1   Samsung 04e8   OnePlus 2a70   Xiaomi 2717
+#   Huawei 12d1   Motorola 22b8   LG 1004   Sony 0fce   HTC 0bb4
