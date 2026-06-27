@@ -855,6 +855,7 @@ class SyncEngine:
             "local_deletions": 0,   # files missing from computer
             "errors": 0,
             "pull_verify_failures": 0,  # pulls that failed hash verification
+            "partial_moves": 0,     # dest written but source not removed
             "bytes_copied": 0,
         }
         self.discovered_subdirs = []
@@ -1497,11 +1498,29 @@ class SyncEngine:
 
             logging.info(f"  Moving on phone: {old_phone} -> {new_phone}")
             result = self.adb.move_safe(old_phone, new_phone, file_hash)
-            if result["ok"]:
+            if result["ok"] and result["source_deleted"]:
+                # Move fully completed: destination has the content AND the
+                # old source is gone. Safe to advance state.
                 self.state.files[relpath]["phone_path"] = new_phone
                 if result["action"] == "already_there":
-                    logging.info(f"    (destination already existed, "
-                                 f"source {'removed' if result['source_deleted'] else 'kept'})")
+                    logging.info(
+                        f"    (destination already existed, source removed)")
+            elif result["ok"] and not result["source_deleted"]:
+                # PARTIAL move: the destination now has the content, but the
+                # old source could not be removed from the phone. The file
+                # physically exists at BOTH paths. Do NOT advance phone_path
+                # to the new location — that would orphan the source and it
+                # would likely be re-ingested as a duplicate next sync. Leave
+                # state pointing at the still-existing old path and surface
+                # the problem.
+                logging.error(
+                    f"  PARTIAL MOVE: destination written but source "
+                    f"could not be removed: {old_phone}. State left "
+                    f"pointing at the old path; resolve on the phone "
+                    f"(the file now exists at both {old_phone} and "
+                    f"{new_phone}).")
+                self.stats["errors"] += 1
+                self.stats["partial_moves"] += 1
             else:
                 self.stats["errors"] += 1
 
@@ -1675,6 +1694,9 @@ class SyncEngine:
         if s["pull_verify_failures"]:
             print(f"  ⚠ Pull verify fails: {s['pull_verify_failures']} "
                   f"(corrupt/truncated transfers, will retry next sync)")
+        if s["partial_moves"]:
+            print(f"  ⚠ Partial moves:  {s['partial_moves']} "
+                  f"(file at both old and new phone path; resolve manually)")
         if s["bytes_copied"] > 0:
             print(f"  Data copied:      {_human_size(s['bytes_copied'])}")
 

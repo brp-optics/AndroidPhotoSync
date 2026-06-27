@@ -851,6 +851,107 @@ class TestComputerMoveDetails:
             b"DIFFERENT_CONTENT_BLOCKING"
 
 
+class TestPartialPhoneMove:
+    """If move_safe writes the destination but cannot remove the source,
+    the move is PARTIAL: state must NOT advance to the new phone path, and
+    the failure must be surfaced."""
+
+    def _partial_move_adb(self):
+        """A FakeADB whose move_safe copies to the destination but leaves
+        the source in place (source_deleted=False), simulating a phone
+        where 'rm' of the source failed."""
+        from conftest import FakeADB
+        import hashlib as _h
+
+        class PartialMoveADB(FakeADB):
+            def move_safe(self, remote_src, remote_dst, expected_hash=None):
+                src = self._local(remote_src)
+                dst = self._local(remote_dst)
+                result = {"ok": False, "action": "",
+                          "source_deleted": False}
+                if dst.exists():
+                    result["action"] = "collision"
+                    return result
+                if not src.exists():
+                    result["action"] = "copy_failed"
+                    return result
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                import shutil as _s
+                _s.copy2(str(src), str(dst))
+                if expected_hash:
+                    actual = _h.sha256(dst.read_bytes()).hexdigest()
+                    if actual != expected_hash:
+                        dst.unlink()
+                        result["action"] = "hash_mismatch"
+                        return result
+                # Simulate a FAILED source deletion: leave src in place.
+                result["ok"] = True
+                result["action"] = "moved"
+                result["source_deleted"] = False
+                return result
+
+        return PartialMoveADB
+
+    def test_partial_move_does_not_advance_state(self, harness, img_data):
+        c, m = img_data("p", 2025, 1, 15)
+        harness.phone_write("a", "DCIM/Camera/IMG_20250115_001.jpg", c, m)
+        harness.sync("a")
+
+        # Sort on the computer to trigger a phone-side move
+        harness.computer_move(
+            "photos/2025/IMG_20250115_001.jpg",
+            "photos/2025/Album/IMG_20250115_001.jpg")
+
+        engine = harness.sync("a", adb_cls=self._partial_move_adb())
+
+        # The destination WAS written on the phone...
+        assert harness.phone_exists(
+            "a", "DCIM/Camera/Album/IMG_20250115_001.jpg")
+        # ...and the source is STILL there (deletion failed)
+        assert harness.phone_exists(
+            "a", "DCIM/Camera/IMG_20250115_001.jpg")
+
+        # State must NOT have advanced to the new path — it should still
+        # point at the old (still-existing) source location.
+        info = harness.get_state("a")["files"][
+            "photos/2025/Album/IMG_20250115_001.jpg"]
+        assert info["phone_path"] == \
+            "/sdcard/DCIM/Camera/IMG_20250115_001.jpg"
+
+        # The partial move was surfaced
+        assert engine.stats["partial_moves"] == 1
+        assert engine.stats["errors"] >= 1
+
+    def test_partial_move_no_duplicate_reingest(self, harness, img_data):
+        """KNOWN DEFECT (TODO #14): after a partial move, the destination
+        file written on the phone is untracked, so the NEXT sync's ingest
+        pass pulls it as a new file before phase 3 completes the move —
+        creating a duplicate on the computer.
+
+        This test documents the current (incorrect) behavior so the bug is
+        visible and pinned. When TODO #14 is fixed, flip the assertions to
+        require files_after == files_before and no duplicate suffix.
+        """
+        c, m = img_data("p", 2025, 1, 15)
+        harness.phone_write("a", "DCIM/Camera/IMG_20250115_001.jpg", c, m)
+        harness.sync("a")
+        harness.computer_move(
+            "photos/2025/IMG_20250115_001.jpg",
+            "photos/2025/Album/IMG_20250115_001.jpg")
+        harness.sync("a", adb_cls=self._partial_move_adb())
+
+        files_before = set(harness.computer_list("photos"))
+        harness.sync("a")  # clean sync completes the move
+        files_after = set(harness.computer_list("photos"))
+
+        # CURRENT behavior: a duplicate is created (documents the defect).
+        new_files = files_after - files_before
+        assert len(new_files) == 1
+        assert any("_phone-a" in f for f in new_files), (
+            "expected the known duplicate suffix; if this fails the bug "
+            "may be fixed — see TODO #14 and update this test")
+
+
 # ---------------------------------------------------------------------------
 # P0: deleted_files report list
 # ---------------------------------------------------------------------------

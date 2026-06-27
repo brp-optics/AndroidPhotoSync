@@ -28,6 +28,20 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import phonesync
 
 
+if HAS_PYTEST:
+    def pytest_configure(config):
+        """Refuse to run under pytest as root.
+
+        Root bypasses filesystem permission bits, making permission-
+        dependent tests give false passes.
+        """
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            pytest.exit(
+                "Refusing to run tests as root: root bypasses permission "
+                "bits and produces false passes. Run as a non-root user.",
+                returncode=2)
+
+
 class FakeADB:
     """Drop-in replacement for phonesync.ADB that operates on local dirs."""
 
@@ -741,11 +755,12 @@ class TestHarness:
         files = self.get_state(phone).get("files", {})
         return files.get(relpath, {}).get("deleted_from_computer", False)
 
-    def sync(self, phone, dry_run=False):
+    def sync(self, phone, dry_run=False, adb_cls=None):
         self.cfg = phonesync.load_config()
         serial = self._phone_serial(phone)
         engine = phonesync.SyncEngine(
-            self.cfg, serial, dry_run=dry_run, adb_cls=FakeADB)
+            self.cfg, serial, dry_run=dry_run,
+            adb_cls=adb_cls or FakeADB)
         engine.run()
         return engine
 
