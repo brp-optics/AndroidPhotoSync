@@ -54,6 +54,7 @@ Data and configuration live in **two separate directories**:
 │   │   ├── IMG_20250115_123456.jpg
 │   │   └── vacation/              ← create subfolders to sort; moves sync back
 │   └── unsorted/                  ← photos without a parseable date
+|       └── IMG_001.jpg            ← (that means no date in filename, EXIF, or mtime)
 ├── downloads/
 │   ├── pixel-8/                   ← separated by device
 │   └── galaxy-s24/
@@ -107,17 +108,25 @@ The **first** time you sync a given device, PhoneSync pauses and asks you to con
 ### 2. Sort on the computer
 Move photos into subfolders however you like:
 ```
-photos/2025/IMG_001.jpg  →  photos/2025/vacation/IMG_001.jpg
+photos/2025/IMG_20250115_123456.jpg  →  photos/2025/vacation/IMG_20250115_123456_Yosemite.jpg
+```
+
+Delete photos you don't want to keep:
+```
+rm photos/unsorted/IMG_001.jpg
 ```
 
 ### 3. Next sync
 PhoneSync detects the move and mirrors it on the phone:
 ```
-/sdcard/DCIM/Camera/IMG_001.jpg  →  /sdcard/DCIM/Camera/vacation/IMG_001.jpg
+/sdcard/DCIM/Camera/IMG_20250115_123456.jpg  →  /sdcard/DCIM/Camera/vacation/IMG_20250115_123456_Yosemite.jpg
 ```
+PhoneSync detects the deletion and marks the file as "not to sync again", but does not delete on the phone.
 
 ### 4. Phone cleanup
 Delete files from the phone to free space — they stay on the computer, and the tool will not re-download them.
+
+Sort files on the phone, and their movements will be synced to the computer next sync.
 
 ## Configuration
 
@@ -169,12 +178,12 @@ Edit `~/.phonesync/config.json`:
 | `check_free_space` | `true` | Before pulling, estimate the bytes to copy and abort (without copying anything) if they wouldn't fit. |
 | `free_space_margin_bytes` | `104857600` (100 MB) | Headroom required on top of the estimate before a sync proceeds. |
 | `overwrite_policy` | `"ask"` | What to do when a file was edited on **both** the phone and the computer since the last sync. `ask` prompts (and keeps local if there's no terminal); `never` always keeps your local edits; `always` always takes the phone version. Can be set per-file (see below). |
-| `exclude_dirs` | (built-in list) | Folder names to skip everywhere (`.thumbnails`, `.trash`, caches…). **This is how you tell PhoneSync to ignore files** — by location, not by content. |
+| `exclude_dirs` | (built-in list) | Folder names to skip everywhere (`.thumbnails`, `.trash`, caches…). **This is how you tell PhoneSync to ignore files**. |
 | `exclude_files` | (built-in list) | Filename patterns to skip (`.nomedia`, `Thumbs.db`…). |
 
 `exclude_dirs` and `exclude_files` default to built-in lists; add entries in the config to extend them.
 
-### Edited on both sides: overwrite protection
+### Edited on both sides: overwrite_policy and overwrite protection
 
 Normally, if you edit a photo on the phone, the next sync re-pulls it and updates the computer copy. But if you *also* edited that file **on the computer** since the last sync (cropped it, fixed metadata, etc.), re-pulling would throw away your local edits. PhoneSync detects this — it compares the file's current on-disk hash against the hash it recorded at the last sync — and applies `overwrite_policy` only in that both-sides-changed case:
 
@@ -200,7 +209,7 @@ Today the tool **never deletes from the phone** regardless of the first two, and
 
 ### Duplicates: everything is kept
 
-Because contents only flow phone → computer, every duplicate that exists is one *you* created on purpose: the same photo saved to two albums, a picture that landed on both phones (they're backups of each other), an app-state backup, and so on. PhoneSync treats all of these as intentional and **keeps every copy**. It never deletes or silently skips a file because its contents match another file.
+Because content only flows phone → computer, every duplicate that exists is one *you* created on purpose: the same photo saved to two albums, a picture that landed on both phones (they're backups of each other), an app-state backup, and so on. PhoneSync treats all of these as intentional and **keeps every copy**. It never deletes or silently skips a file because its contents match another file.
 
 To *ignore* certain files, do it by **folder**, not by content — add the folder to `exclude_dirs` (this is how `.thumbnails`, `.trash`, and other caches are already skipped). "Ignore this location" is meaningful; "ignore these bytes because they repeat" is not, since the repetition is deliberate.
 
@@ -237,7 +246,7 @@ The tests use a local-filesystem fake for ADB, so no phone is needed. The runner
 
 These are described here as goals, not current behavior:
 
-- **Auto-sync on plug-in** — a udev rule + systemd service to run `sync` automatically when a phone is connected. An **experimental** uv-based installer ships in `contrib/` (`./contrib/install.sh --with-service`); it installs the launcher, a systemd unit, and a udev rule. It's opt-in and still rough. The approved-devices registry provides the key safety scoping regardless: an unattended sync only touches devices you've approved with `phonesync devices --approve`, so an unknown phone plugged in is skipped, not synced. Setup is manual — see below.
+- **Auto-sync on plug-in** — a udev rule + systemd service to run `sync` automatically when a phone is connected. An **experimental** uv-based installer is included (`./install.sh --with-service`); it installs the launcher, a systemd unit, and a udev rule. It's opt-in and still rough. The approved-devices registry provides the key safety scoping regardless: an unattended sync only touches devices you've approved with `phonesync devices --approve`, so an unknown phone plugged in is skipped, not synced. Setup is manual — see below.
 
 ### Setting up auto-sync (experimental)
 
