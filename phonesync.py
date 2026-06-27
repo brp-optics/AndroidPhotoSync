@@ -121,6 +121,7 @@ def default_config(config_dir: str = None, data_dir: str = None):
         "keep_duplicates": True,  # Keep files with same hash but different names
         "recursive_scan": True,   # Scan subdirectories on phone
         "preserve_phone_subdirs": True,  # Maintain subdirectory structure from phone
+        "verify_pulls": True,     # Hash-verify each pull against the phone
         "exclude_dirs": DEFAULT_EXCLUDE_DIRS,
         "exclude_files": DEFAULT_EXCLUDE_FILES,
         "followlinks": "Hardcoded_True",
@@ -283,6 +284,13 @@ class DeviceState:
 
     def save(self):
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
+        # Back up the PREVIOUS state file before overwriting it, so a bad
+        # write or logic bug can be rolled back. Never let a backup failure
+        # block the actual save.
+        try:
+            self._backup_state_file()
+        except Exception as e:
+            logging.warning(f"State backup failed (continuing): {e}")
         data = {
             "device_serial": self.device_serial,
             "device_name": self.device_name,
@@ -290,6 +298,32 @@ class DeviceState:
             "files": self.files,
         }
         _atomic_json_write(self.state_path, data)
+
+    def _backup_state_file(self, keep: int = 10):
+        """Copy the current on-disk state file into a timestamped backup.
+
+        Keeps the most recent `keep` backups for this device, pruning
+        older ones. No-op if there's no existing state file yet.
+        """
+        if not self.state_path.exists():
+            return
+        backup_dir = self.state_path.parent / "state-backups"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        stem = self.state_path.stem  # e.g. "state-phone-a"
+        backup_path = backup_dir / f"{stem}.{stamp}.json"
+        shutil.copy2(str(self.state_path), str(backup_path))
+
+        # Prune old backups for THIS device only
+        backups = sorted(
+            backup_dir.glob(f"{stem}.*.json"),
+            key=lambda p: p.name)
+        excess = len(backups) - keep
+        for old in backups[:max(0, excess)]:
+            try:
+                old.unlink()
+            except OSError:
+                pass
 
     def add_file(self, computer_relpath: str, phone_path: str,
                  file_hash: str, size: int, phone_mtime: str, category: str,
@@ -820,6 +854,7 @@ class SyncEngine:
             "phone_moves_detected": 0,
             "local_deletions": 0,   # files missing from computer
             "errors": 0,
+            "pull_verify_failures": 0,  # pulls that failed hash verification
             "bytes_copied": 0,
         }
         self.discovered_subdirs = []
@@ -1171,10 +1206,42 @@ class SyncEngine:
             tmp_path = tmp_dir / filename
 
             if self.dry_run:
+                # Compute and report the destination so the user can verify
+                # where files would land. For photos we need the bytes to
+                # read EXIF, so pull to a temp file, compute, then discard.
+                # For downloads/recordings the destination is computable
+                # without the bytes.
+                action = "re-pull" if existing else "copy"
                 if existing:
-                    logging.info(f"  [DRY RUN] Would re-pull: {phone_path}")
+                    # Re-pull lands at the existing tracked location.
+                    dest_display = existing
+                elif category == "photos":
+                    pulled = self.adb.pull(phone_path, str(tmp_path))
+                    if pulled:
+                        dest_dir = self._compute_photo_dest(
+                            str(tmp_path), filename, phone_relpath,
+                            phone_mtime_epoch=finfo["mtime_epoch"])
+                        dest_path = safe_filename(
+                            dest_dir, filename, self.device_name)
+                        dest_display = str(
+                            dest_path.relative_to(self.data_dir))
+                        tmp_path.unlink(missing_ok=True)
+                    else:
+                        dest_display = "(could not pull to determine dest)"
                 else:
-                    logging.info(f"  [DRY RUN] Would copy: {phone_path}")
+                    dest_dir = self._dest_dir_for_category(category)
+                    if self.cfg.get("preserve_phone_subdirs", True):
+                        subdir = os.path.dirname(phone_relpath)
+                        if subdir:
+                            dest_dir = dest_dir / subdir
+                    dest_path = safe_filename(
+                        dest_dir, filename, self.device_name)
+                    dest_display = str(dest_path.relative_to(self.data_dir))
+
+                logging.info(
+                    f"  [DRY RUN] Would {action}: {phone_path}")
+                logging.info(
+                    f"              -> {dest_display}")
                 self.stats["files_copied"] += 1
                 continue
 
@@ -1185,6 +1252,33 @@ class SyncEngine:
                 continue
 
             local_hash = file_sha256(str(tmp_path))
+
+            # Pull integrity check: compare the freshly-pulled bytes against
+            # the phone's own hash of the same file. Catches truncated or
+            # corrupted transfers (disconnect mid-pull, ADB flake) BEFORE we
+            # commit anything to the library or state. On by default; can be
+            # disabled for speed on large trusted batches.
+            if self.cfg.get("verify_pulls", True):
+                phone_hash = self.adb.file_hash(phone_path)
+                if phone_hash is None:
+                    logging.warning(
+                        f"  Could not verify pull (no phone hash) for "
+                        f"{phone_path}; skipping to be safe.")
+                    tmp_path.unlink(missing_ok=True)
+                    self.stats["errors"] += 1
+                    self.stats["pull_verify_failures"] += 1
+                    continue
+                if phone_hash != local_hash:
+                    logging.error(
+                        f"  PULL INTEGRITY FAILURE: {phone_path}")
+                    logging.error(
+                        f"    phone={phone_hash[:12]}... "
+                        f"local={local_hash[:12]}... — discarding, "
+                        f"will retry next sync.")
+                    tmp_path.unlink(missing_ok=True)
+                    self.stats["errors"] += 1
+                    self.stats["pull_verify_failures"] += 1
+                    continue
 
             # If this is a re-pull of a changed file, update in place
             if existing:
@@ -1578,6 +1672,9 @@ class SyncEngine:
             print(f"  Phone moves:      {s['phone_moves_detected']}")
         print(f"  Moves synced:     {s['moves_synced']}")
         print(f"  Errors:           {s['errors']}")
+        if s["pull_verify_failures"]:
+            print(f"  ⚠ Pull verify fails: {s['pull_verify_failures']} "
+                  f"(corrupt/truncated transfers, will retry next sync)")
         if s["bytes_copied"] > 0:
             print(f"  Data copied:      {_human_size(s['bytes_copied'])}")
 

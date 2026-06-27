@@ -228,6 +228,84 @@ class TestPhoneMoveDetection:
 # Ingest phase — edge cases
 # ---------------------------------------------------------------------------
 
+class TestPullVerification:
+    """Pull integrity: a corrupt/truncated transfer must be caught and
+    NOT committed to the library or state."""
+
+    def _corrupting_adb(self):
+        """A FakeADB whose pull() truncates the file, but whose file_hash()
+        still reports the true phone-side hash (so verification mismatches)."""
+        from conftest import FakeADB
+
+        class CorruptingFakeADB(FakeADB):
+            def pull(self, remote_path, local_path):
+                src = self._local(remote_path)
+                if not src.exists():
+                    return False
+                from pathlib import Path as _P
+                _P(local_path).parent.mkdir(parents=True, exist_ok=True)
+                # Write TRUNCATED/altered bytes to simulate a bad transfer
+                data = src.read_bytes()
+                _P(local_path).write_bytes(data[:-1] + b"X"
+                                           if data else b"X")
+                return True
+
+        return CorruptingFakeADB
+
+    def test_corrupt_pull_not_committed(self, harness, img_data):
+        c, m = img_data("p", 2025, 1, 15)
+        harness.phone_write("a", "DCIM/Camera/IMG_20250115_001.jpg", c, m)
+        engine = harness.sync("a", adb_cls=self._corrupting_adb())
+
+        # Nothing committed to the library
+        assert not harness.computer_exists(
+            "photos/2025/IMG_20250115_001.jpg")
+        # Nothing committed to state
+        assert harness.state_file_count("a") == 0
+        # Counted as an error + a verify failure
+        assert engine.stats["errors"] >= 1
+        assert engine.stats["pull_verify_failures"] == 1
+        assert engine.stats["files_copied"] == 0
+
+    def test_corrupt_pull_retried_next_sync(self, harness, img_data):
+        """After a corrupt pull, a subsequent clean sync succeeds."""
+        c, m = img_data("p", 2025, 1, 15)
+        harness.phone_write("a", "DCIM/Camera/IMG_20250115_001.jpg", c, m)
+        # First sync corrupts
+        harness.sync("a", adb_cls=self._corrupting_adb())
+        assert harness.state_file_count("a") == 0
+
+        # Second sync with a healthy ADB succeeds
+        engine = harness.sync("a")
+        assert engine.stats["files_copied"] == 1
+        assert harness.computer_exists(
+            "photos/2025/IMG_20250115_001.jpg")
+        assert harness.computer_read(
+            "photos/2025/IMG_20250115_001.jpg") == c
+
+    def test_verify_pulls_can_be_disabled(self, harness, img_data):
+        """With verify_pulls=false, the integrity check is skipped (the
+        corrupt bytes are committed — documents the trade-off)."""
+        cfg = phonesync.load_config()
+        cfg["verify_pulls"] = False
+        phonesync.save_config(cfg)
+
+        c, m = img_data("p", 2025, 1, 15)
+        harness.phone_write("a", "DCIM/Camera/IMG_20250115_001.jpg", c, m)
+        engine = harness.sync("a", adb_cls=self._corrupting_adb())
+        # Without verification, the (corrupt) file IS committed
+        assert engine.stats["files_copied"] == 1
+        assert engine.stats["pull_verify_failures"] == 0
+
+    def test_clean_pull_passes_verification(self, harness, img_data):
+        """A normal pull passes verification and commits as usual."""
+        c, m = img_data("p", 2025, 1, 15)
+        harness.phone_write("a", "DCIM/Camera/IMG_20250115_001.jpg", c, m)
+        engine = harness.sync("a")  # default FakeADB, clean pull
+        assert engine.stats["pull_verify_failures"] == 0
+        assert engine.stats["files_copied"] == 1
+
+
 class TestIngestPhase:
     def test_tombstone_blocks_reingest(self, harness, img_data):
         """A tombstoned file is not re-ingested even though it's on the phone."""
@@ -570,6 +648,48 @@ class TestDryRunGuarantees:
         harness.phone_write("a", "DCIM/Camera/IMG_20250115_001.jpg", c, m)
         engine = harness.sync("a", dry_run=True)
         assert engine.stats["files_copied"] == 1
+
+    def test_dry_run_reports_destination(self, harness):
+        """Dry-run logs the destination path for each file, including the
+        resolved photo date-folder."""
+        import logging
+
+        records = []
+
+        class _Capture(logging.Handler):
+            def emit(self, record):
+                records.append(record.getMessage())
+
+        handler = _Capture()
+        logger = logging.getLogger()
+        old_level = logger.level
+        logger.addHandler(handler)
+        logger.setLevel(logging.INFO)
+        try:
+            # Filename date → photos/2023/
+            harness.phone_write(
+                "a", "DCIM/Camera/IMG_20230712_001.jpg", b"photo",
+                1689163200.0)
+            harness.phone_write("a", "Download/report.pdf", b"pdf")
+            harness.sync("a", dry_run=True)
+        finally:
+            logger.removeHandler(handler)
+            logger.setLevel(old_level)
+
+        joined = "\n".join(records)
+        # Destination lines present with the resolved year folder
+        assert "photos/2023/IMG_20230712_001.jpg" in joined
+        assert "downloads/phone-a/report.pdf" in joined
+
+    def test_dry_run_leaves_no_temp_files(self, harness, img_data):
+        """Dry-run's photo pull-to-temp is cleaned up afterward."""
+        c, m = img_data("p", 2025, 1, 15)
+        harness.phone_write("a", "DCIM/Camera/IMG_20250115_001.jpg", c, m)
+        harness.sync("a", dry_run=True)
+        tmp_dir = harness.cfg_dir / "tmp"
+        # tmp dir should be gone or empty after the run
+        if tmp_dir.exists():
+            assert list(tmp_dir.iterdir()) == []
 
 
 # ---------------------------------------------------------------------------
