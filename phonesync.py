@@ -118,14 +118,17 @@ def default_config(config_dir: str = None, data_dir: str = None):
         "data_dir": str(data_dir or DEFAULT_DATA_DIR),
         "devices": {},
         "photo_date_folders": True,
-        "keep_duplicates": True,  # Keep files with same hash but different names
         "recursive_scan": True,   # Scan subdirectories on phone
         "preserve_phone_subdirs": True,  # Maintain subdirectory structure from phone
         "verify_pulls": True,     # Hash-verify each pull against the phone
-        "use_library_index": True,  # Skip pulling content already in library
+        "use_library_index": True,  # Cache library hashes; complete partial moves
         "exclude_dirs": DEFAULT_EXCLUDE_DIRS,
         "exclude_files": DEFAULT_EXCLUDE_FILES,
         "followlinks": "Hardcoded_True",
+        # Reserved for future use — NOT read by the current code. The tool
+        # never deletes from the phone, never propagates computer deletes,
+        # and always resolves move conflicts in favor of the computer. See
+        # the "Reserved keys" section of the README.
         "delete_from_phone_after_sync": False,
         "propagate_computer_deletes_to_phone": False,
         "conflict_resolution": "prefer_computer",
@@ -952,10 +955,8 @@ class LibraryIndex:
         self._cache = new_cache
         self._loaded = True
         # Freeze the set of hashes present BEFORE this run's ingest begins.
-        # The library-skip uses this so that two identical files pulled
-        # within the SAME run don't suppress each other (which would break
-        # keep_duplicates=true); only content already on disk before the run
-        # suppresses a re-pull.
+        # The move-completion check uses this so a file pulled earlier in the
+        # SAME run can't be mistaken for a pre-existing library copy.
         self._prerun_hashes = set(self._by_hash.keys())
         self._prerun_sizes = {
             v["size"] for v in self._cache.values() if "size" in v}
@@ -1011,8 +1012,6 @@ class SyncEngine:
             "files_copied": 0,
             "files_skipped": 0,
             "files_updated": 0,     # re-pulled due to mtime change
-            "duplicates_kept": 0,
-            "duplicates_skipped": 0,  # keep_duplicates=false re-pulls
             "moves_synced": 0,
             "phone_moves_detected": 0,
             "move_conflicts": 0,    # ambiguous move targets, not guessed
@@ -1020,7 +1019,7 @@ class SyncEngine:
             "errors": 0,
             "pull_verify_failures": 0,  # pulls that failed hash verification
             "partial_moves": 0,     # dest written but source not removed
-            "library_skipped": 0,   # already present in library, not pulled
+            "move_completions": 0,  # partial-move dest recognized, not re-pulled
             "bytes_copied": 0,
         }
         self.discovered_subdirs = []
@@ -1525,65 +1524,54 @@ class SyncEngine:
                 self.stats["files_copied"] += 1
                 continue
 
-            # Library skip (#8/#14): for a genuinely-new file (not tracked
-            # by phone_path), if its content already exists in the library
-            # from BEFORE this run, we may be able to avoid re-pulling it.
+            # Move completion (#14): a partial phone move can leave content
+            # at a NEW phone path that we don't yet track by phone_path,
+            # while a tracked entry for THIS device still points at the old
+            # path. On the next sync that new path looks like a brand-new
+            # file and would be re-pulled, creating a duplicate. We detect
+            # the one specific case where that's wrong: this untracked phone
+            # file's content is already in the library AND it sits exactly
+            # where a tracked same-device file is trying to move to (its
+            # computed desired phone path). That's a move finishing, not a
+            # new file — adopt it without re-pulling.
             #
-            # Scope (chosen carefully to respect keep_duplicates):
-            #  - keep_duplicates FALSE: dedup is the whole point — if the
-            #    content is already on disk, skip the pull.
-            #  - keep_duplicates TRUE: only skip when this untracked phone
-            #    file is the DESTINATION a tracked file is moving to (its
-            #    desired phone path), i.e. a partial-move completion (#14).
-            #    A genuinely new independent duplicate the user created on
-            #    the phone is still pulled (keep_duplicates honored), as is
-            #    the same photo arriving from a different device.
+            # This is the ONLY case where we suppress a pull. Every other
+            # duplicate (same photo on two phones, the same photo in two
+            # albums on one phone, etc.) is intentional and gets kept. Junk
+            # is excluded by folder via exclude_dirs, not by content.
             #
-            # We always get the phone's own hash first; if we can't, fall
-            # through to a normal pull (never skip on uncertainty).
+            # The phone hash is only fetched when the cheap size pre-filter
+            # says a same-size file exists in the library; on uncertainty we
+            # fall through to a normal pull (never skip).
             if (not existing and not self.dry_run
                     and self.cfg.get("use_library_index", True)
                     and self.library.maybe_prerun_size(size)):
                 phone_hash = self.adb.file_hash(phone_path)
                 if phone_hash and self.library.contains_hash_prerun(
                         phone_hash):
-                    lib_paths = self.library.paths_for_hash(phone_hash)
-                    keep_duplicates = self.cfg.get("keep_duplicates", True)
-
-                    adopt_relpath = None
-                    if not keep_duplicates and lib_paths:
-                        adopt_relpath = lib_paths[0]
-                    else:
-                        # keep_duplicates: only adopt if this phone_path is
-                        # the move destination of a tracked same-device entry
-                        # whose content matches (partial-move completion).
-                        for lp in lib_paths:
-                            e = self.state.files.get(lp)
-                            if not e or e.get("device_name") != \
-                                    self.device_name:
-                                continue
-                            desired = self._compute_desired_phone_path(
-                                self.data_dir / lp, e)
-                            if desired == phone_path:
-                                adopt_relpath = lp
-                                break
-
-                    if adopt_relpath is not None:
-                        existing_entry = self.state.files.get(adopt_relpath)
-                        owner = (existing_entry or {}).get("device_name")
-                        if existing_entry is None or \
-                                owner == self.device_name:
-                            mtime_iso = datetime.fromtimestamp(
-                                finfo["mtime_epoch"]).isoformat()
-                            self.state.add_file(
-                                adopt_relpath, phone_path, phone_hash,
-                                size, mtime_iso, category,
-                                phone_source_dir=phone_dir)
-                            logging.info(
-                                f"  Already in library, not pulling: "
-                                f"{phone_path} -> {adopt_relpath}")
-                            self.stats["library_skipped"] += 1
+                    completion_relpath = None
+                    for lp in self.library.paths_for_hash(phone_hash):
+                        e = self.state.files.get(lp)
+                        if not e or e.get("device_name") != self.device_name:
                             continue
+                        desired = self._compute_desired_phone_path(
+                            self.data_dir / lp, e)
+                        if desired == phone_path:
+                            completion_relpath = lp
+                            break
+
+                    if completion_relpath is not None:
+                        mtime_iso = datetime.fromtimestamp(
+                            finfo["mtime_epoch"]).isoformat()
+                        self.state.add_file(
+                            completion_relpath, phone_path, phone_hash,
+                            size, mtime_iso, category,
+                            phone_source_dir=phone_dir)
+                        logging.info(
+                            f"  Move completed (already in library, not "
+                            f"pulling): {phone_path} -> {completion_relpath}")
+                        self.stats["move_completions"] += 1
+                        continue
 
             logging.info(f"  {'Re-pulling' if existing else 'Copying'}: "
                          f"{phone_path} ({_human_size(size)})")
@@ -1671,28 +1659,12 @@ class SyncEngine:
                             f"{existing}. Treating as new file.")
                         del self.state.files[existing]
 
-            # Check for duplicate by hash
-            existing_by_hash = self.state.find_by_hash_and_device(local_hash)
-            keep_duplicates = self.cfg.get("keep_duplicates", True)
-
-            if existing_by_hash and not keep_duplicates:
-                logging.info(f"  Skipping (duplicate by hash): {filename}")
-                logging.debug(
-                    f"    Note: keep_duplicates=false means this file "
-                    f"will be re-pulled and re-hashed every sync. "
-                    f"Consider keep_duplicates=true if you have many "
-                    f"duplicates on the phone.")
-                tmp_path.unlink(missing_ok=True)
-                # Do NOT overwrite the existing entry's phone_path —
-                # that would lose the original phone_path tracking.
-                # The duplicate phone_path simply isn't tracked.
-                self.stats["duplicates_skipped"] += 1
-                self.stats["files_skipped"] += 1
-                continue
-            elif existing_by_hash:
-                logging.info(f"  Keeping duplicate (same content, "
-                             f"different path): {phone_path}")
-                self.stats["duplicates_kept"] += 1
+            # Duplicates are always kept. A file whose content matches
+            # another file (same photo in two albums, the same photo on two
+            # phones, an app-state backup, etc.) is a deliberate copy from
+            # the user's point of view — this is a one-way ingest tool, so
+            # every duplicate already existed on a phone on purpose. Junk is
+            # excluded by folder (exclude_dirs), never by content identity.
 
             # Determine destination
             if category == "photos":
@@ -1716,8 +1688,9 @@ class SyncEngine:
             self.state.add_file(
                 relpath, phone_path, local_hash, size, mtime_iso, category,
                 phone_source_dir=phone_dir)
-            # Keep the live index current (do NOT add to the pre-run set, so
-            # same-run duplicates still follow keep_duplicates semantics).
+            # Keep the live index current (the pre-run snapshot is frozen,
+            # so a file pulled this run won't be mistaken for a pre-existing
+            # library copy by a later move-completion check).
             try:
                 self.library.add(
                     relpath, local_hash, size,
@@ -2021,24 +1994,13 @@ class SyncEngine:
         prefix = "[DRY RUN] " if self.dry_run else ""
         print(f"\n{prefix}Sync complete for {self.device_name}:")
         print(f"  Files copied:     {s['files_copied']}")
-        if s["library_skipped"]:
-            print(f"  Already in library: {s['library_skipped']} "
-                  f"(content present, not pulled)")
+        if s["move_completions"]:
+            print(f"  Moves completed:  {s['move_completions']} "
+                  f"(already in library, not re-pulled)")
         if s["files_updated"]:
             print(f"  Files updated:    {s['files_updated']} "
                   f"(re-pulled, mtime changed)")
         print(f"  Files skipped:    {s['files_skipped']} (already synced)")
-        if s["duplicates_kept"]:
-            print(f"  Duplicates kept:  {s['duplicates_kept']} "
-                  f"(same content, different path)")
-        if s["duplicates_skipped"]:
-            print(f"  Duplicates skip:  {s['duplicates_skipped']} "
-                  f"(re-pulled to verify, keep_duplicates=false)")
-            if s["duplicates_skipped"] > 10:
-                print(f"  ⚠ {s['duplicates_skipped']} duplicate files were "
-                      f"pulled and discarded. With keep_duplicates=false, "
-                      f"this happens every sync. Consider "
-                      f"keep_duplicates=true to avoid repeated transfers.")
         if s["phone_moves_detected"]:
             print(f"  Phone moves:      {s['phone_moves_detected']}")
         if s["move_conflicts"]:

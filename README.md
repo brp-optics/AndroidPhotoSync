@@ -1,102 +1,130 @@
 # AndroidPhotoSync
-A CLI tool for sync of photos, downloads, and recordings from Android phone(s) to Linux via ADB. Supports two phones merging into one photo library with automatic reverse-syncing of file sorting that happens on Linux. File deletions on computer are not synced in either direction, and deleted files aren't filled in again. Requires python, uv, and adb enabled on each device. Test harness requires pillow and pytest.
+
+A single-file CLI tool that syncs photos, downloads, and recordings from one or two Android phones to a Linux computer over ADB (USB debugging). Two phones merge into one photo library, and when you sort photos into subfolders on the computer those moves are mirrored back to the phone. Deletions are never propagated in either direction, and a file you delete on the computer is not re-downloaded.
+
+This is a **one-way ingest** tool: file contents only ever flow **phone → computer**. The tool never deletes anything from a phone, and never deletes from the computer in response to a phone-side change.
 
 ## Features
 
-- **Automatic sync** when phone is plugged in via USB (via udev + systemd)
-- **Multiple phones, one library** — photos merge into date-based folders, deduped by content hash
-- **Smart photo organization** — sorted into `YYYY/MM` folders initially using EXIF data or filename dates
-- **Move tracking** — sort photos into subfolders on your computer, and the moves propagate to your phone(s)
-- **Safe deletes** — deleting from phone(s) doesn't remove from computer; deleting from computer doesn't remove from phones.
-- **Collision handling** — files with the same name but different content get device-suffixed names
-- **Dry run mode** — preview what would happen without changing anything
+- **Multiple phones, one library** — photos from both phones merge into date-based folders; every copy is kept (duplicates are never silently dropped)
+- **Photo organization** — photos sorted into `photos/YYYY/` folders using EXIF data or a date parsed from the filename; photos with no usable date go to `photos/unsorted/`
+- **Move tracking** — sort photos into subfolders on your computer and the moves propagate to your phone(s)
+- **Safe by default** — deleting from a phone never removes the computer copy; deleting from the computer never removes the phone copy; pulls are hash-verified against the phone to catch corrupt transfers; state is backed up before every write
+- **Collision handling** — two different files that need the same name in the same folder get device-suffixed names (e.g. `IMG_001_galaxy-s24.jpg`)
+- **Dry-run mode** — preview exactly what would happen, including destination paths, without changing anything
+
+## Requirements
+
+- `adb` (Android Debug Bridge) — `sudo apt install adb`
+- Python 3.10+
+- [`uv`](https://docs.astral.sh/uv/) to run it and manage dependencies
+- Pillow (for EXIF date parsing) — declared in `pyproject.toml`, installed automatically by `uv`
+- USB debugging enabled on each phone
+
+The test suite additionally needs `pytest` (declared as a dev dependency). It can be run with `uv run pytest` or with the bundled `run_tests.py`.
 
 ## Quick Start
 
 ```bash
-# Install
 git clone <repo> && cd phonesync
-./install.sh
 
-# Enable USB debugging on your phone (one-time):
+# Enable USB debugging on each phone (one-time):
 #   Settings → About Phone → tap Build Number 7 times
 #   Settings → Developer Options → USB Debugging → ON
 
-# Plug in phone, authorize the connection on the phone screen
+# Plug in the phone and authorize the connection on the phone screen.
 
-# Test
-phonesync devices          # verify phone is detected
-phonesync sync --dry-run   # preview what would be synced
-phonesync sync             # do it for real
+uv run phonesync.py devices            # verify the phone is detected
+uv run phonesync.py config --init      # create config + data directories
+uv run phonesync.py detect-paths --apply  # auto-detect media dirs into config
+uv run phonesync.py sync --dry-run     # preview what would be synced
+uv run phonesync.py sync               # do it for real
 ```
+
+> The examples above invoke `phonesync.py` directly with `uv run`. If you put the script on your `PATH` as `phonesync`, drop the `uv run` prefix and the `.py`.
 
 ## Directory Structure
 
+Data and configuration live in **two separate directories**:
+
 ```
-~/PhoneSync/
-├── photos/                    ← both phones merge here
-│   ├── 2025/
-│   │   ├── 01/
-│   │   │   ├── IMG_20250115_123456.jpg
-│   │   │   └── vacation/     ← you can create subfolders to sort!
-│   │   └── 02/
-│   └── unsorted/              ← photos without parseable dates
+~/PhoneSync/                       ← data directory (your files)
+├── photos/                        ← both phones merge here
+│   ├── 2025/                      ← sorted by year (EXIF or filename date)
+│   │   ├── IMG_20250115_123456.jpg
+│   │   └── vacation/              ← create subfolders to sort; moves sync back
+│   └── unsorted/                  ← photos without a parseable date
 ├── downloads/
-│   ├── pixel-8/               ← separated by device
+│   ├── pixel-8/                   ← separated by device
 │   └── galaxy-s24/
-├── recordings/
-│   ├── pixel-8/
-│   └── galaxy-s24/
-└── .phonesync/
-    ├── config.json
-    ├── state-pixel-8.json
-    └── state-galaxy-s24.json
+└── recordings/
+    ├── pixel-8/
+    └── galaxy-s24/
+
+~/.phonesync/                      ← config directory
+├── config.json
+├── library-index.json             ← cached content hashes of the library
+├── state-pixel-8.json             ← per-device sync state
+├── state-galaxy-s24.json
+└── state-backups/                 ← timestamped state backups (last 10)
 ```
+
+Photos are sorted by **year only** (`photos/YYYY/`), not `YYYY/MM`.
 
 ## Commands
 
 | Command | Description |
 |---------|-------------|
 | `phonesync sync` | Sync all connected phones |
-| `phonesync sync -d SERIAL` | Sync a specific phone |
-| `phonesync sync --dry-run` | Preview without changing anything |
-| `phonesync status` | Show sync status and stats |
-| `phonesync devices` | List connected ADB devices |
+| `phonesync sync -d SERIAL` | Sync a specific phone by ADB serial |
+| `phonesync sync -n` / `--dry-run` | Preview without changing anything |
+| `phonesync status` | Show config/data directories and per-device sync stats |
+| `phonesync devices` | List connected ADB devices and storage volumes |
+| `phonesync detect-paths` | Auto-detect media directories on connected phone(s) |
+| `phonesync detect-paths --apply` | Apply detected paths to the config |
 | `phonesync config` | Show current config |
 | `phonesync config --init` | Initialize config and directories |
-| `phonesync reset-state` | Reset state (forces full re-scan) |
+| `phonesync config --config-dir DIR` / `--data-dir DIR` | Use non-default locations |
+| `phonesync reset-state` | Reset sync state (forces a full re-scan next sync) |
+| `phonesync prune-state` | Remove stale state entries (keeps tombstones) |
+| `phonesync prune-state --clear-tombstones` | Also drop tombstones (deleted files will re-download) |
+| `phonesync prune-state --rehash` | Recompute file hashes (slow but thorough) |
+
+Add `-v` / `--verbose` for debug logging. `sync` exits non-zero if a device scan fails mid-run.
 
 ## Workflow
 
-### 1. Initial Sync
-Plug in phone → phonesync copies all photos/downloads/recordings to your computer.
+### 1. Initial sync
+Plug in the phone and run `sync`; PhoneSync copies all photos, downloads, and recordings to the computer.
 
-### 2. Sort on Computer
-Move photos into subfolders as you like:
+### 2. Sort on the computer
+Move photos into subfolders however you like:
 ```
-photos/2025/01/IMG_001.jpg  →  photos/2025/01/vacation/IMG_001.jpg
+photos/2025/IMG_001.jpg  →  photos/2025/vacation/IMG_001.jpg
 ```
 
-### 3. Next Sync
+### 3. Next sync
 PhoneSync detects the move and mirrors it on the phone:
 ```
 /sdcard/DCIM/Camera/IMG_001.jpg  →  /sdcard/DCIM/Camera/vacation/IMG_001.jpg
 ```
 
-### 4. Phone Cleanup
-Delete files from phone to save space — they stay safe on your computer.
+### 4. Phone cleanup
+Delete files from the phone to free space — they stay on the computer, and the tool will not re-download them.
 
 ## Configuration
 
-Edit `~/PhoneSync/.phonesync/config.json`:
+Edit `~/.phonesync/config.json`:
 
 ```json
 {
-  "base_dir": "/home/you/PhoneSync",
+  "config_dir": "/home/you/.phonesync",
+  "data_dir": "/home/you/PhoneSync",
   "photo_date_folders": true,
-  "delete_from_phone_after_sync": false,
-  "propagate_computer_deletes_to_phone": false,
-  "conflict_resolution": "prefer_computer",
+  "recursive_scan": true,
+  "preserve_phone_subdirs": true,
+  "verify_pulls": true,
+  "use_library_index": true,
   "devices": {
     "SERIAL123": {
       "name": "pixel-8",
@@ -115,64 +143,75 @@ Edit `~/PhoneSync/.phonesync/config.json`:
 }
 ```
 
-### Adding custom source directories
+`phonesync config --init` writes a starting config, and `phonesync detect-paths --apply` fills in sensible `sources` for each connected device. If your phone stores files in non-standard locations, edit `sources` for that device.
 
-If your phone stores files in non-standard locations, edit the `sources` for that device in the config.
+### What the options mean
 
-## Auto-Sync Service
+| Option | Default | Effect |
+|--------|---------|--------|
+| `photo_date_folders` | `true` | Sort photos into `photos/YYYY/` by EXIF/filename date. `false` puts them flat under `photos/`. |
+| `recursive_scan` | `true` | Scan subdirectories of each source. `false` scans only the top level. |
+| `preserve_phone_subdirs` | `true` | Mirror the phone's subfolder structure under `downloads/`/`recordings/` and under the photo year folder. |
+| `verify_pulls` | `true` | After each pull, compare the copied bytes against the phone's own hash and discard the copy if they differ. Catches truncated transfers. Leave on. |
+| `use_library_index` | `true` | Cache content hashes of the library so syncs are faster and an interrupted move is recognized instead of re-pulled. |
+| `exclude_dirs` | (built-in list) | Folder names to skip everywhere (`.thumbnails`, `.trash`, caches…). **This is how you tell PhoneSync to ignore files** — by location, not by content. |
+| `exclude_files` | (built-in list) | Filename patterns to skip (`.nomedia`, `Thumbs.db`…). |
 
-The installer sets up:
-- **udev rule** (`/etc/udev/rules.d/99-phonesync.rules`) — detects when an Android phone is plugged in
-- **systemd service** (`/etc/systemd/system/phonesync.service`) — runs `phonesync sync` automatically
+`exclude_dirs` and `exclude_files` default to built-in lists; add entries in the config to extend them.
 
-### Check logs
-```bash
-journalctl -u phonesync -f          # follow live
-journalctl -u phonesync --since today  # today's logs
-```
+### Reserved keys (not yet implemented)
 
-### Troubleshoot auto-sync
-```bash
-# Check if service ran
-systemctl status phonesync
+These keys may appear in a config and are accepted, but the current code does **not** act on them. They are placeholders for possible future features:
 
-# Manually trigger
-sudo systemctl start phonesync
+| Key | Intended (future) meaning |
+|-----|---------------------------|
+| `delete_from_phone_after_sync` | Delete a file from the phone once it's safely on the computer. |
+| `propagate_computer_deletes_to_phone` | Mirror a computer-side deletion back to the phone. |
+| `conflict_resolution` | Choose the winner when a file is moved on both sides. |
 
-# Check udev rule
-udevadm monitor --subsystem-match=usb   # then plug in phone
-
-# Verify your phone's vendor ID is in the udev rule
-lsusb   # find your phone's ID, add to 99-phonesync.rules if missing
-```
+Today the tool **never deletes from the phone** regardless of the first two, and a move-on-both-sides conflict always resolves to the **computer's** location.
 
 ## How It Works
 
-### Deduplication
-Files are tracked by SHA256 hash. If both phones have the same photo (e.g., shared via messaging), it's only stored once on the computer.
+### Duplicates: everything is kept
 
-### Move Detection
-Each sync, PhoneSync checks if files it previously synced still exist at their expected paths. If a file is missing but found elsewhere (by hash), it's recorded as a move.
+Because contents only flow phone → computer, every duplicate that exists is one *you* created on purpose: the same photo saved to two albums, a picture that landed on both phones (they're backups of each other), an app-state backup, and so on. PhoneSync treats all of these as intentional and **keeps every copy**. It never deletes or silently skips a file because its contents match another file.
 
-### Conflict Resolution
-If the same file is moved to different locations on both phone and computer, the computer's location wins (configurable via `conflict_resolution`).
+To *ignore* certain files, do it by **folder**, not by content — add the folder to `exclude_dirs` (this is how `.thumbnails`, `.trash`, and other caches are already skipped). "Ignore this location" is meaningful; "ignore these bytes because they repeat" is not, since the repetition is deliberate.
 
-## Dependencies
+Content hashes (SHA256) are still recorded, but only to do safe work that never loses data:
+- **Move detection** — recognizing that a file you sorted into a subfolder is the same file, so it isn't re-copied.
+- **Pull verification** — confirming each pulled file matches the phone's own hash, catching truncated transfers.
+- **Completing an interrupted move** — if a move to the phone half-finished on a previous run, the leftover copy is recognized instead of being re-pulled as a "new" file.
 
-- `adb` (Android Debug Bridge) — `sudo apt install adb`
-- Python 3.8+
-- Pillow (optional, for EXIF date parsing) — `pip install pillow`
+### Move detection
+Each sync, PhoneSync checks whether files it previously synced still exist at their expected phone paths. If a tracked file is gone from its path but its content is found at another path, that's recorded as a move (the file isn't re-downloaded). When several untracked copies share the same content, the tool uses filename and modification-time hints to pick the move target, and refuses to guess if they're genuinely ambiguous.
 
-## Uninstall
+### Conflict resolution
+If the same file is moved to different locations on both the phone and the computer, the computer's location wins. (This is currently fixed behavior; see the reserved `conflict_resolution` key above.)
+
+### Safety
+- Pulls are verified against the phone's hash; a corrupt/truncated transfer is discarded and retried next sync.
+- Each device's state file is backed up (timestamped, last 10 kept) before every write.
+- If a phone becomes unreachable mid-scan, the run aborts loudly without saving state, rather than acting on a partial view that could mistreat files it couldn't see.
+
+## Running the tests
 
 ```bash
-sudo rm /usr/local/bin/phonesync
-sudo rm /etc/udev/rules.d/99-phonesync.rules
-sudo rm /etc/systemd/system/phonesync.service
-sudo udevadm control --reload-rules
-sudo systemctl daemon-reload
-# Your synced files in ~/PhoneSync remain untouched
+uv run pytest                 # via pytest
+python3 run_tests.py          # or the bundled runner (must NOT be run as root)
 ```
 
-### Bugs / improvements:
-- Configurable location for each source directory?
+The tests use a local-filesystem fake for ADB, so no phone is needed. The runner refuses to run as root because root bypasses the file-permission bits that some tests rely on.
+
+## Planned / not yet implemented
+
+These are described here as goals, not current behavior:
+
+- **Auto-sync on plug-in** — a udev rule + systemd service to run `sync` automatically when a phone is connected. (No installer, udev rule, or service unit ships today; run `sync` manually for now.)
+- **`phonesync doctor`** — verify that the phone's `find`/`stat`/`printf` scan command behaves as expected on the device's toybox before trusting a large sync.
+- The reserved config keys listed above.
+
+## Notes / ideas
+
+- Per-source-directory configurable destinations.
