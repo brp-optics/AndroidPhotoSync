@@ -143,7 +143,7 @@ class TestSyncEngineInitialIngest:
 # ---------------------------------------------------------------------------
 
 class TestSyncEngineDuplicates:
-    def test_same_phone_duplicate_kept_when_config_true(self, harness):
+    def test_same_phone_same_run_duplicate_content_keeps_both(self, harness):
         h = harness
         content = b"same duplicate content"
         h.phone_write(
@@ -154,41 +154,32 @@ class TestSyncEngineDuplicates:
             "a", "DCIM/Camera/Sub/IMG_20250115.jpg", content,
             mtime=_mtime(2025, 1, 15),
         )
-
+        
         engine = h.sync("a")
-
+        
         assert engine.stats["files_copied"] == 2
-        assert engine.stats["duplicates_kept"] == 1
         assert h.computer_exists("photos/2025/IMG_20250115.jpg")
         assert h.computer_exists("photos/2025/Sub/IMG_20250115.jpg")
         assert h.state_file_count("a") == 2
 
-    def test_same_phone_duplicate_skipped_when_config_false(self, harness):
+    def test_existing_library_content_does_not_suppress_normal_new_phone_file(
+            self, harness
+):
         h = harness
-        h.cfg["keep_duplicates"] = False
-        _save_cfg(h)
+        content = b"already in library"
 
-        content = b"same duplicate content"
+        h.computer_write("photos/2025/existing.jpg", content)
         h.phone_write(
             "a", "DCIM/Camera/IMG_20250115.jpg", content,
-            mtime=_mtime(2025, 1, 15),
-        )
-        h.phone_write(
-            "a", "DCIM/Camera/Sub/IMG_20250115.jpg", content,
             mtime=_mtime(2025, 1, 15),
         )
 
         engine = h.sync("a")
 
         assert engine.stats["files_copied"] == 1
-        assert engine.stats["duplicates_skipped"] == 1
+        assert engine.stats["move_completions"] == 0
+        assert h.computer_exists("photos/2025/existing.jpg")
         assert h.computer_exists("photos/2025/IMG_20250115.jpg")
-        assert not h.computer_exists("photos/2025/Sub/IMG_20250115.jpg")
-        assert h.state_file_count("a") == 1
-        assert all(
-            info["phone_path"] != "/sdcard/DCIM/Camera/Sub/IMG_20250115.jpg"
-            for info in _state_files(h, "a").values()
-        )
 
     def test_two_phones_same_filename_different_content_are_collision_safe(
         self, harness

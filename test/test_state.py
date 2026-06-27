@@ -6,6 +6,61 @@ from pathlib import Path
 import phonesync
 
 
+class TestSafeFilename:
+    """safe_filename uses check-then-act: it returns a name that doesn't
+    exist yet, and the caller materializes the file before the next call.
+    That is safe ONLY because sync is single-threaded and serialized by the
+    SyncLock (see TestSyncLock) — there are no concurrent copies racing on a
+    name. These tests pin the function's behavior and that audit assumption
+    (TODO #1): once a returned name exists on disk, the next call yields a
+    DIFFERENT name.
+    """
+
+    def test_no_collision_returns_name(self):
+        with tempfile.TemporaryDirectory() as d:
+            got = phonesync.safe_filename(Path(d), "IMG.jpg")
+            assert got == Path(d) / "IMG.jpg"
+
+    def test_collision_prefers_device_suffix(self):
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "IMG.jpg").write_bytes(b"x")
+            got = phonesync.safe_filename(Path(d), "IMG.jpg", "pixel-8")
+            assert got == Path(d) / "IMG_pixel-8.jpg"
+
+    def test_collision_without_device_uses_counter(self):
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "IMG.jpg").write_bytes(b"x")
+            got = phonesync.safe_filename(Path(d), "IMG.jpg")
+            assert got == Path(d) / "IMG_1.jpg"
+
+    def test_sequential_materialized_names_are_distinct(self):
+        """The exact pattern the ingest loop uses: each returned name is
+        written to disk before the next call, so three identically-named
+        files get three distinct paths (no clobbering)."""
+        with tempfile.TemporaryDirectory() as d:
+            paths = []
+            for _ in range(3):
+                p = phonesync.safe_filename(Path(d), "IMG.jpg", "pixel-8")
+                p.write_bytes(b"data")  # materialize, as the caller does
+                paths.append(p)
+            assert len(set(paths)) == 3
+            assert all(p.exists() for p in paths)
+            assert (Path(d) / "IMG.jpg") in paths
+            assert (Path(d) / "IMG_pixel-8.jpg") in paths
+
+    def test_check_then_act_window_is_documented(self):
+        """Without materializing between calls, the SAME name is returned —
+        this is the check-then-act window the SyncLock + single-threaded
+        model close. Documents why the lock is load-bearing for #1."""
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "IMG.jpg").write_bytes(b"x")
+            a = phonesync.safe_filename(Path(d), "IMG.jpg", "pixel-8")
+            b = phonesync.safe_filename(Path(d), "IMG.jpg", "pixel-8")
+            # Identical, because neither was written to disk: concurrent
+            # callers WOULD collide. Serialization is what prevents it.
+            assert a == b
+
+
 class TestAtomicWrite:
     def test_basic_write(self):
         with tempfile.TemporaryDirectory() as d:

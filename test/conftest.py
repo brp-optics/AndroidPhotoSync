@@ -644,7 +644,7 @@ class TestHarness:
             "config_dir": str(self.cfg_dir),
             "data_dir": str(self.data_dir),
             "photo_date_folders": True, "recursive_scan": True,
-            "keep_duplicates": True, "preserve_phone_subdirs": True,
+            "preserve_phone_subdirs": True,
             "delete_from_phone_after_sync": False,
             "propagate_computer_deletes_to_phone": False,
             "max_symlink_depth": 2,
@@ -662,6 +662,11 @@ class TestHarness:
             },
         }
         phonesync.save_config(self.cfg)
+        # Pre-approve both test devices so the first-time-device gate (#5)
+        # doesn't block the many tests that sync a fresh device. Tests that
+        # exercise the gate itself clear this via forget_device().
+        phonesync.approve_device(self.cfg, "SERIAL_A", "phone-a")
+        phonesync.approve_device(self.cfg, "SERIAL_B", "phone-b")
         return self
 
     def __exit__(self, *args):
@@ -679,6 +684,16 @@ class TestHarness:
 
     def _phone_serial(self, phone):
         return "SERIAL_A" if phone == "a" else "SERIAL_B"
+
+    def unapprove_device(self, phone):
+        """Remove a device from the approved registry, so the next sync hits
+        the first-time-device gate (#5)."""
+        phonesync.forget_device(
+            phonesync.load_config(), self._phone_serial(phone))
+
+    def is_approved(self, phone):
+        return phonesync.is_device_known(
+            phonesync.load_config(), self._phone_serial(phone))
 
     def phone_write(self, phone, relpath, content, mtime=None):
         p = self._phone_dir(phone) / relpath
@@ -771,7 +786,8 @@ class TestHarness:
         engine = phonesync.SyncEngine(
             self.cfg, serial, dry_run=dry_run,
             adb_cls=adb_cls or FakeADB)
-        engine.run()
+        # Capture the run() boolean so tests can assert on abort behavior.
+        engine.run_result = engine.run()
         return engine
 
     def sync_all(self, dry_run=False):
