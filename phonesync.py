@@ -122,6 +122,15 @@ def default_config(config_dir: str = None, data_dir: str = None):
         "preserve_phone_subdirs": True,  # Maintain subdirectory structure from phone
         "verify_pulls": True,     # Hash-verify each pull against the phone
         "use_library_index": True,  # Cache library hashes; complete partial moves
+        "read_only": False,       # Never write to the phone (skip move propagation)
+        "check_free_space": True,  # Abort before pulling if the disk would fill
+        "free_space_margin_bytes": 104857600,  # 100 MB headroom over estimate
+        # What to do when a phone edit would overwrite a computer file that
+        # was ALSO edited locally since the last sync: "ask" (prompt when
+        # interactive, otherwise keep local), "never" (always keep local),
+        # or "always" (always take the phone version). Per-file overrides are
+        # stored in each file's state entry as "overwrite_policy".
+        "overwrite_policy": "ask",
         "exclude_dirs": DEFAULT_EXCLUDE_DIRS,
         "exclude_files": DEFAULT_EXCLUDE_FILES,
         "followlinks": "Hardcoded_True",
@@ -1020,11 +1029,15 @@ class SyncEngine:
             "pull_verify_failures": 0,  # pulls that failed hash verification
             "partial_moves": 0,     # dest written but source not removed
             "move_completions": 0,  # partial-move dest recognized, not re-pulled
+            "phone_writes_suppressed": 0,  # phone moves skipped in read-only mode
+            "overwrites_applied": 0,   # local file overwritten by phone edit
+            "overwrites_kept_local": 0,  # phone edit declined, local file kept
             "bytes_copied": 0,
         }
         self.discovered_subdirs = []
         self.deleted_files = []  # [(relpath, category)] for deletion report
         self._scan_failed = False
+        self._aborted_no_space = False
         # Shared on-disk content index of the library (built in run()).
         self.library = LibraryIndex(self.data_dir, cfg)
         # Relpaths whose phone_path was updated by phone-side move detection
@@ -1193,6 +1206,15 @@ class SyncEngine:
         # so moved files aren't re-ingested as new)
         self._phase_detect_phone_moves()
 
+        # Free-space pre-flight (#4): estimate the bytes phase 2 may pull and
+        # refuse to start a large copy that won't fit, rather than failing
+        # partway with files scattered. Skipped in dry-run.
+        if not self.dry_run and self.cfg.get("check_free_space", True):
+            if not self._check_free_space():
+                # Abort before pulling: no state saved, nothing copied.
+                self._aborted_no_space = True
+                return False
+
         # Phase 2: Ingest genuinely new files
         self._phase_ingest()
 
@@ -1209,6 +1231,136 @@ class SyncEngine:
 
         self._print_summary()
         return True
+
+    def _estimate_pull_bytes(self) -> int:
+        """Upper-bound estimate of bytes phase 2 may pull this run.
+
+        Sums the sizes of every scanned, relevant file whose phone_path is
+        NOT already tracked for this device and is NOT tombstoned. This
+        over-counts slightly (e.g. content the library would recognize as a
+        move completion), which is the safe direction for a space check.
+        """
+        tracked_paths = {
+            info["phone_path"]
+            for info in self.state.files.values()
+            if info.get("device_name") == self.device_name
+            and not info.get("deleted_from_computer")
+        }
+        total = 0
+        for category, dir_scans in self.phone_scan.items():
+            for phone_dir, files in dir_scans:
+                for finfo in files:
+                    if not self._is_relevant_file(finfo["name"], category):
+                        continue
+                    if finfo["path"] in tracked_paths:
+                        continue
+                    total += finfo.get("size", 0)
+        return total
+
+    def _check_free_space(self) -> bool:
+        """Return True if it's safe to proceed; False to abort the run.
+
+        Compares the estimated pull size (plus a safety margin) against free
+        space on the data filesystem. Aborts loudly if it won't fit.
+        """
+        try:
+            estimate = self._estimate_pull_bytes()
+        except Exception as e:
+            # Never let estimation failure block a sync; just skip the check.
+            logging.debug(f"Free-space estimate failed, skipping check: {e}")
+            return True
+
+        if estimate <= 0:
+            return True
+
+        margin = int(self.cfg.get("free_space_margin_bytes", 100 * 1024 * 1024))
+        needed = estimate + margin
+        try:
+            self.data_dir.mkdir(parents=True, exist_ok=True)
+            free = shutil.disk_usage(str(self.data_dir)).free
+        except OSError as e:
+            logging.debug(f"disk_usage failed, skipping check: {e}")
+            return True
+
+        if free < needed:
+            logging.error(
+                f"NOT ENOUGH FREE SPACE to sync {self.device_name}.")
+            logging.error(
+                f"  Estimated to copy: {_human_size(estimate)} "
+                f"(+ {_human_size(margin)} margin = {_human_size(needed)})")
+            logging.error(
+                f"  Free on {self.data_dir}: {_human_size(free)}")
+            logging.error(
+                "  Aborting before copying anything. Free up space or move "
+                "the data directory, then sync again.")
+            self.stats["errors"] += 1
+            return False
+
+        logging.info(
+            f"  Free-space check OK: need ~{_human_size(needed)}, "
+            f"have {_human_size(free)}")
+        return True
+
+    def _is_interactive(self) -> bool:
+        """True if we can prompt the user. False under cron/udev/automation
+        or when stdin isn't a terminal. Overridable in tests."""
+        try:
+            return sys.stdin is not None and sys.stdin.isatty()
+        except (AttributeError, ValueError):
+            return False
+
+    def _prompt_overwrite(self, relpath: str) -> str:
+        """Ask the user what to do about overwriting a locally-edited file.
+
+        Returns one of: "overwrite", "keep", "always", "never".
+        Overridable in tests. Only called when interactive.
+        """
+        print(f"\n  ⚠ '{relpath}' was edited BOTH on the phone and locally "
+              f"since the last sync.")
+        print("    Overwriting will replace your local edits with the phone "
+              "version.")
+        prompt = ("    [o]verwrite once / [k]eep local once / "
+                  "[a]lways overwrite this file / [n]ever overwrite "
+                  "this file: ")
+        mapping = {"o": "overwrite", "k": "keep",
+                   "a": "always", "n": "never"}
+        while True:
+            try:
+                choice = input(prompt).strip().lower()[:1]
+            except EOFError:
+                return "keep"
+            if choice in mapping:
+                return mapping[choice]
+
+    def _resolve_overwrite(self, relpath: str, info: dict) -> str:
+        """Decide whether a phone edit may overwrite a locally-edited file.
+
+        Returns "overwrite" (take the phone version) or "keep" (preserve the
+        local file). Honors a per-file policy stored in state, then the
+        global config policy. In "ask" mode prompts only when interactive;
+        non-interactively it keeps local (the safe choice — automation must
+        never silently destroy local edits). "always"/"never" answers from a
+        prompt are persisted to the file's state entry.
+        """
+        policy = info.get("overwrite_policy") \
+            or self.cfg.get("overwrite_policy", "ask")
+
+        if policy == "always":
+            return "overwrite"
+        if policy == "never":
+            return "keep"
+
+        # policy == "ask"
+        if not self._is_interactive():
+            return "keep"
+        answer = self._prompt_overwrite(relpath)
+        if answer == "always":
+            info["overwrite_policy"] = "always"
+            return "overwrite"
+        if answer == "never":
+            info["overwrite_policy"] = "never"
+            return "keep"
+        return answer  # "overwrite" or "keep" (one-time)
 
     def _scan_phone(self) -> dict:
         """Scan all configured phone source directories once.
@@ -1612,6 +1764,42 @@ class SyncEngine:
             if existing:
                 old_computer_path = self.data_dir / existing
                 if old_computer_path.exists():
+                    # Overwrite protection (#7): the phone copy changed, but
+                    # did the LOCAL copy also change since we last synced? If
+                    # the on-disk hash no longer matches the hash we recorded,
+                    # the user edited the computer file, and overwriting would
+                    # destroy that edit. Resolve via per-file/global policy.
+                    info = self.state.files[existing]
+                    stored_hash = info.get("hash")
+                    local_changed = False
+                    if stored_hash:
+                        try:
+                            current_local_hash = file_sha256(
+                                str(old_computer_path))
+                            local_changed = (
+                                current_local_hash != stored_hash
+                                and current_local_hash != local_hash)
+                        except OSError:
+                            local_changed = False
+
+                    if local_changed:
+                        decision = self._resolve_overwrite(existing, info)
+                        if decision == "keep":
+                            logging.warning(
+                                f"  Keeping local edits, NOT overwriting: "
+                                f"{existing}")
+                            tmp_path.unlink(missing_ok=True)
+                            # Acknowledge we've seen this phone version so we
+                            # don't re-evaluate the SAME version every sync,
+                            # but leave the local file and its (locally
+                            # edited) hash untouched.
+                            info["phone_mtime"] = datetime.fromtimestamp(
+                                finfo["mtime_epoch"]).isoformat()
+                            self.stats["overwrites_kept_local"] += 1
+                            continue
+                        else:
+                            self.stats["overwrites_applied"] += 1
+
                     shutil.move(str(tmp_path), str(old_computer_path))
                     mtime_iso = datetime.fromtimestamp(
                         finfo["mtime_epoch"]).isoformat()
@@ -1804,12 +1992,18 @@ class SyncEngine:
                         (info["phone_path"], desired,
                          relpath, info["hash"]))
 
-        # Execute phone-side moves with collision safety
+        # Execute phone-side moves with collision safety.
+        # In read-only mode (or dry-run) we never write to the phone: we
+        # report what would move but leave the phone and state untouched.
+        read_only = self.cfg.get("read_only", False)
         for old_phone, new_phone, relpath, file_hash in moves_to_apply:
-            if self.dry_run:
+            if self.dry_run or read_only:
+                tag = "[DRY RUN]" if self.dry_run else "[READ-ONLY]"
                 logging.info(
-                    f"  [DRY RUN] Would move on phone: "
+                    f"  {tag} Would move on phone: "
                     f"{old_phone} -> {new_phone}")
+                if read_only and not self.dry_run:
+                    self.stats["phone_writes_suppressed"] += 1
                 continue
 
             # Check that source still exists on phone
@@ -2000,6 +2194,13 @@ class SyncEngine:
         if s["files_updated"]:
             print(f"  Files updated:    {s['files_updated']} "
                   f"(re-pulled, mtime changed)")
+        if s["overwrites_kept_local"]:
+            print(f"  ⚠ Local kept:     {s['overwrites_kept_local']} "
+                  f"file(s) edited on BOTH sides; local edits preserved, "
+                  f"phone version not applied")
+        if s["overwrites_applied"]:
+            print(f"  Local overwritten: {s['overwrites_applied']} "
+                  f"file(s) had local edits replaced by the phone version")
         print(f"  Files skipped:    {s['files_skipped']} (already synced)")
         if s["phone_moves_detected"]:
             print(f"  Phone moves:      {s['phone_moves_detected']}")
@@ -2007,6 +2208,9 @@ class SyncEngine:
             print(f"  ⚠ Move conflicts: {s['move_conflicts']} "
                   f"(ambiguous identical copies; not guessed — see log)")
         print(f"  Moves synced:     {s['moves_synced']}")
+        if s["phone_writes_suppressed"]:
+            print(f"  Read-only:        {s['phone_writes_suppressed']} "
+                  f"phone move(s) suppressed (no phone writes)")
         print(f"  Errors:           {s['errors']}")
         if s["pull_verify_failures"]:
             print(f"  ⚠ Pull verify fails: {s['pull_verify_failures']} "
@@ -2089,6 +2293,12 @@ def _human_size(size_bytes: int) -> str:
 
 def cmd_sync(args):
     cfg = load_config()
+    # A --read-only flag forces read_only on for this run, overriding config.
+    if getattr(args, "read_only", False):
+        cfg["read_only"] = True
+    # --overwrite-policy overrides the config policy for this run.
+    if getattr(args, "overwrite_policy", None):
+        cfg["overwrite_policy"] = args.overwrite_policy
     lock = SyncLock(Path(cfg["config_dir"]))
 
     if not lock.acquire():
@@ -2456,6 +2666,14 @@ def main():
     p_sync.add_argument(
         "-n", "--dry-run", action="store_true",
         help="Show what would be done")
+    p_sync.add_argument(
+        "--read-only", action="store_true",
+        help="Never write to the phone (skip move propagation)")
+    p_sync.add_argument(
+        "--overwrite-policy", choices=["ask", "never", "always"],
+        help="When a file was edited on BOTH phone and computer: ask "
+             "(default; keeps local if non-interactive), never (always keep "
+             "local edits), or always (always take the phone version)")
 
     # status
     subparsers.add_parser("status", help="Show sync status")

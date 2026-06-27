@@ -1152,6 +1152,361 @@ class TestComputerMoveDetails:
             b"DIFFERENT_CONTENT_BLOCKING"
 
 
+class TestOverwriteProtection:
+    """When a file is edited on BOTH the phone and the computer since the
+    last sync, the phone version must not silently clobber the local edits.
+    Policy: ask (interactive) / never / always; per-file overrides persist."""
+
+    def _edit_then_phone_change(self, harness, img_data):
+        """Sync a file, edit it locally, then change it on the phone (new
+        content + newer mtime). Returns the relpath."""
+        c, m = img_data("p", 2025, 1, 15)
+        harness.phone_write("a", "DCIM/Camera/IMG_20250115_001.jpg", c, m)
+        harness.sync("a")
+        relpath = "photos/2025/IMG_20250115_001.jpg"
+        # Local edit (changes the on-disk hash).
+        harness.computer_write(relpath, b"LOCALLY_EDITED_CONTENT")
+        # Phone change: different content, newer mtime.
+        harness.phone_write("a", "DCIM/Camera/IMG_20250115_001.jpg",
+                            b"PHONE_EDITED_CONTENT", m + 1000)
+        return relpath
+
+    def test_never_keeps_local(self, harness, img_data):
+        cfg = phonesync.load_config()
+        cfg["overwrite_policy"] = "never"
+        phonesync.save_config(cfg)
+
+        relpath = self._edit_then_phone_change(harness, img_data)
+        engine = harness.sync("a")
+
+        # Local edits preserved; phone version NOT applied.
+        assert harness.computer_read(relpath) == b"LOCALLY_EDITED_CONTENT"
+        assert engine.stats["overwrites_kept_local"] == 1
+        assert engine.stats["files_updated"] == 0
+
+    def test_always_takes_phone_version(self, harness, img_data):
+        cfg = phonesync.load_config()
+        cfg["overwrite_policy"] = "always"
+        phonesync.save_config(cfg)
+
+        relpath = self._edit_then_phone_change(harness, img_data)
+        engine = harness.sync("a")
+
+        assert harness.computer_read(relpath) == b"PHONE_EDITED_CONTENT"
+        assert engine.stats["overwrites_applied"] == 1
+        assert engine.stats["files_updated"] == 1
+
+    def test_ask_non_interactive_keeps_local(self, harness, img_data):
+        """In ask mode with no TTY (automation), local is kept — automation
+        must never destroy local edits."""
+        cfg = phonesync.load_config()
+        cfg["overwrite_policy"] = "ask"
+        phonesync.save_config(cfg)
+
+        # Force non-interactive.
+        orig = phonesync.SyncEngine._is_interactive
+        phonesync.SyncEngine._is_interactive = lambda self: False
+        try:
+            relpath = self._edit_then_phone_change(harness, img_data)
+            engine = harness.sync("a")
+        finally:
+            phonesync.SyncEngine._is_interactive = orig
+
+        assert harness.computer_read(relpath) == b"LOCALLY_EDITED_CONTENT"
+        assert engine.stats["overwrites_kept_local"] == 1
+
+    def test_ask_interactive_overwrite_choice(self, harness, img_data):
+        """Interactive 'overwrite' answer applies the phone version once."""
+        cfg = phonesync.load_config()
+        cfg["overwrite_policy"] = "ask"
+        phonesync.save_config(cfg)
+
+        orig_i = phonesync.SyncEngine._is_interactive
+        orig_p = phonesync.SyncEngine._prompt_overwrite
+        phonesync.SyncEngine._is_interactive = lambda self: True
+        phonesync.SyncEngine._prompt_overwrite = \
+            lambda self, relpath: "overwrite"
+        try:
+            relpath = self._edit_then_phone_change(harness, img_data)
+            engine = harness.sync("a")
+        finally:
+            phonesync.SyncEngine._is_interactive = orig_i
+            phonesync.SyncEngine._prompt_overwrite = orig_p
+
+        assert harness.computer_read(relpath) == b"PHONE_EDITED_CONTENT"
+        assert engine.stats["overwrites_applied"] == 1
+
+    def test_ask_always_choice_persists_per_file(self, harness, img_data):
+        """Answering 'always' writes a per-file policy so a later phone edit
+        is overwritten WITHOUT prompting again."""
+        cfg = phonesync.load_config()
+        cfg["overwrite_policy"] = "ask"
+        phonesync.save_config(cfg)
+
+        prompt_calls = {"n": 0}
+
+        def counting_prompt(self, relpath):
+            prompt_calls["n"] += 1
+            return "always"
+
+        orig_i = phonesync.SyncEngine._is_interactive
+        orig_p = phonesync.SyncEngine._prompt_overwrite
+        phonesync.SyncEngine._is_interactive = lambda self: True
+        phonesync.SyncEngine._prompt_overwrite = counting_prompt
+        try:
+            relpath = self._edit_then_phone_change(harness, img_data)
+            harness.sync("a")  # prompts once -> "always", overwrites
+            # The per-file policy is now persisted in state.
+            info = harness.get_state("a")["files"][relpath]
+            assert info.get("overwrite_policy") == "always"
+
+            # Edit locally again, change phone again -> should NOT prompt.
+            harness.computer_write(relpath, b"LOCAL_EDIT_2")
+            c, m = img_data("p", 2025, 1, 15)
+            harness.phone_write(
+                "a", "DCIM/Camera/IMG_20250115_001.jpg",
+                b"PHONE_EDIT_2", m + 2000)
+            engine = harness.sync("a")
+        finally:
+            phonesync.SyncEngine._is_interactive = orig_i
+            phonesync.SyncEngine._prompt_overwrite = orig_p
+
+        assert prompt_calls["n"] == 1  # only the first time
+        assert harness.computer_read(relpath) == b"PHONE_EDIT_2"
+        assert engine.stats["overwrites_applied"] == 1
+
+    def test_ask_never_choice_persists_and_keeps(self, harness, img_data):
+        """Answering 'never' keeps local now AND persists the per-file policy
+        so a later phone edit is skipped without prompting again."""
+        cfg = phonesync.load_config()
+        cfg["overwrite_policy"] = "ask"
+        phonesync.save_config(cfg)
+
+        prompt_calls = {"n": 0}
+
+        def counting_prompt(self, relpath):
+            prompt_calls["n"] += 1
+            return "never"
+
+        orig_i = phonesync.SyncEngine._is_interactive
+        orig_p = phonesync.SyncEngine._prompt_overwrite
+        phonesync.SyncEngine._is_interactive = lambda self: True
+        phonesync.SyncEngine._prompt_overwrite = counting_prompt
+        try:
+            relpath = self._edit_then_phone_change(harness, img_data)
+            e1 = harness.sync("a")
+            assert e1.stats["overwrites_kept_local"] == 1
+            assert harness.computer_read(relpath) == b"LOCALLY_EDITED_CONTENT"
+            info = harness.get_state("a")["files"][relpath]
+            assert info.get("overwrite_policy") == "never"
+
+            # Another phone edit; must keep local WITHOUT prompting again.
+            c, m = img_data("p", 2025, 1, 15)
+            harness.phone_write(
+                "a", "DCIM/Camera/IMG_20250115_001.jpg",
+                b"PHONE_EDIT_AGAIN", m + 5000)
+            e2 = harness.sync("a")
+        finally:
+            phonesync.SyncEngine._is_interactive = orig_i
+            phonesync.SyncEngine._prompt_overwrite = orig_p
+
+        assert prompt_calls["n"] == 1
+        assert e2.stats["overwrites_kept_local"] == 1
+        assert harness.computer_read(relpath) == b"LOCALLY_EDITED_CONTENT"
+
+    def test_no_local_edit_overwrites_normally(self, harness, img_data):
+        """If only the phone changed (local untouched), the re-pull proceeds
+        normally — no prompt, no 'kept local'."""
+        cfg = phonesync.load_config()
+        cfg["overwrite_policy"] = "never"  # would block IF it triggered
+        phonesync.save_config(cfg)
+
+        c, m = img_data("p", 2025, 1, 15)
+        harness.phone_write("a", "DCIM/Camera/IMG_20250115_001.jpg", c, m)
+        harness.sync("a")
+        relpath = "photos/2025/IMG_20250115_001.jpg"
+        # Phone changes; local is NOT touched.
+        harness.phone_write("a", "DCIM/Camera/IMG_20250115_001.jpg",
+                            b"PHONE_ONLY_CHANGE", m + 1000)
+        engine = harness.sync("a")
+
+        assert harness.computer_read(relpath) == b"PHONE_ONLY_CHANGE"
+        assert engine.stats["files_updated"] == 1
+        assert engine.stats["overwrites_kept_local"] == 0
+
+    def test_kept_local_not_renagged_same_phone_version(self, harness,
+                                                        img_data):
+        """After keeping local, the SAME phone version isn't re-flagged on
+        the next sync (phone_mtime acknowledged)."""
+        cfg = phonesync.load_config()
+        cfg["overwrite_policy"] = "never"
+        phonesync.save_config(cfg)
+
+        relpath = self._edit_then_phone_change(harness, img_data)
+        e1 = harness.sync("a")
+        assert e1.stats["overwrites_kept_local"] == 1
+        # Second sync with NOTHING further changed: not re-flagged.
+        e2 = harness.sync("a")
+        assert e2.stats["overwrites_kept_local"] == 0
+        assert harness.computer_read(relpath) == b"LOCALLY_EDITED_CONTENT"
+
+
+class TestFreeSpacePreflight:
+    """check_free_space=true must abort BEFORE pulling when the estimated
+    copy (plus margin) won't fit, leaving nothing copied and no state saved."""
+
+    def test_aborts_when_insufficient_space(self, harness, img_data):
+        # An absurd margin forces the check to fail regardless of real disk.
+        cfg = phonesync.load_config()
+        cfg["check_free_space"] = True
+        cfg["free_space_margin_bytes"] = 10 ** 18  # ~1 EB
+        phonesync.save_config(cfg)
+
+        c, m = img_data("p", 2025, 1, 15)
+        harness.phone_write("a", "DCIM/Camera/IMG_20250115_001.jpg", c, m)
+        engine = harness.sync("a")
+
+        # Aborted before any copy.
+        assert engine.run_result is False
+        assert engine._aborted_no_space is True
+        assert engine.stats["files_copied"] == 0
+        # Nothing landed on disk, and no state was saved.
+        assert not harness.computer_exists(
+            "photos/2025/IMG_20250115_001.jpg")
+        assert harness.state_file_count("a") == 0
+
+    def test_proceeds_with_reasonable_margin(self, harness, img_data):
+        cfg = phonesync.load_config()
+        cfg["check_free_space"] = True
+        cfg["free_space_margin_bytes"] = 1024  # 1 KB, trivially satisfiable
+        phonesync.save_config(cfg)
+
+        c, m = img_data("p", 2025, 1, 15)
+        harness.phone_write("a", "DCIM/Camera/IMG_20250115_001.jpg", c, m)
+        engine = harness.sync("a")
+        assert engine.stats["files_copied"] == 1
+        assert engine._aborted_no_space is False
+        assert harness.computer_exists(
+            "photos/2025/IMG_20250115_001.jpg")
+
+    def test_check_can_be_disabled(self, harness, img_data):
+        """With check_free_space=false, even an absurd margin is ignored."""
+        cfg = phonesync.load_config()
+        cfg["check_free_space"] = False
+        cfg["free_space_margin_bytes"] = 10 ** 18
+        phonesync.save_config(cfg)
+
+        c, m = img_data("p", 2025, 1, 15)
+        harness.phone_write("a", "DCIM/Camera/IMG_20250115_001.jpg", c, m)
+        engine = harness.sync("a")
+        assert engine.stats["files_copied"] == 1
+        assert engine._aborted_no_space is False
+
+    def test_estimate_excludes_already_tracked(self, harness, img_data):
+        """Files already synced (tracked for this device) are not counted in
+        the pull estimate — only genuinely-new bytes are."""
+        c, m = img_data("p", 2025, 1, 15)
+        harness.phone_write("a", "DCIM/Camera/IMG_20250115_001.jpg", c, m)
+        harness.sync("a")  # now tracked
+
+        # Build a fresh engine to inspect the estimate against the same scan.
+        from conftest import FakeADB
+        cfg = phonesync.load_config()
+        engine = phonesync.SyncEngine(cfg, "SERIAL_A", adb_cls=FakeADB)
+        engine.phone_scan = engine._scan_phone()
+        # The one file is already tracked, so the estimate is zero.
+        assert engine._estimate_pull_bytes() == 0
+
+    def test_dry_run_skips_check(self, harness, img_data):
+        """Dry-run never aborts on space (it copies nothing anyway)."""
+        cfg = phonesync.load_config()
+        cfg["check_free_space"] = True
+        cfg["free_space_margin_bytes"] = 10 ** 18
+        phonesync.save_config(cfg)
+
+        c, m = img_data("p", 2025, 1, 15)
+        harness.phone_write("a", "DCIM/Camera/IMG_20250115_001.jpg", c, m)
+        engine = harness.sync("a", dry_run=True)
+        assert engine._aborted_no_space is False
+
+
+class TestReadOnlyMode:
+    """read_only=true must never write to the phone, while still ingesting
+    (reading) normally."""
+
+    def test_read_only_suppresses_phone_move(self, harness, img_data):
+        c, m = img_data("p", 2025, 1, 15)
+        harness.phone_write("a", "DCIM/Camera/IMG_20250115_001.jpg", c, m)
+        harness.sync("a")
+
+        harness.computer_move(
+            "photos/2025/IMG_20250115_001.jpg",
+            "photos/2025/trip/IMG_20250115_001.jpg")
+
+        cfg = phonesync.load_config()
+        cfg["read_only"] = True
+        phonesync.save_config(cfg)
+        engine = harness.sync("a")
+
+        # Phone file did NOT move; original still present.
+        assert harness.phone_exists(
+            "a", "DCIM/Camera/IMG_20250115_001.jpg")
+        assert not harness.phone_exists(
+            "a", "DCIM/Camera/trip/IMG_20250115_001.jpg")
+        # The suppression is counted.
+        assert engine.stats["phone_writes_suppressed"] == 1
+        # State's phone_path is NOT advanced (it would lie otherwise).
+        info = harness.get_state("a")["files"][
+            "photos/2025/trip/IMG_20250115_001.jpg"]
+        assert info["phone_path"] == \
+            "/sdcard/DCIM/Camera/IMG_20250115_001.jpg"
+
+    def test_read_only_still_ingests(self, harness, img_data):
+        """Reads are unaffected by read-only mode."""
+        cfg = phonesync.load_config()
+        cfg["read_only"] = True
+        phonesync.save_config(cfg)
+
+        c, m = img_data("p", 2025, 1, 15)
+        harness.phone_write("a", "DCIM/Camera/IMG_20250115_001.jpg", c, m)
+        engine = harness.sync("a")
+        assert engine.stats["files_copied"] == 1
+        assert harness.computer_exists(
+            "photos/2025/IMG_20250115_001.jpg")
+
+    def test_read_only_no_phone_writes_at_all(self, harness, img_data):
+        """A sentinel ADB that fails on any write proves read-only never
+        calls a phone-write method."""
+        from conftest import FakeADB
+
+        class NoWriteADB(FakeADB):
+            def move_safe(self, *a, **k):
+                raise AssertionError("move_safe called in read-only mode")
+
+            def move(self, *a, **k):
+                raise AssertionError("move called in read-only mode")
+
+            def push(self, *a, **k):
+                raise AssertionError("push called in read-only mode")
+
+            def delete(self, *a, **k):
+                raise AssertionError("delete called in read-only mode")
+
+        c, m = img_data("p", 2025, 1, 15)
+        harness.phone_write("a", "DCIM/Camera/IMG_20250115_001.jpg", c, m)
+        harness.sync("a", adb_cls=NoWriteADB)
+        harness.computer_move(
+            "photos/2025/IMG_20250115_001.jpg",
+            "photos/2025/trip/IMG_20250115_001.jpg")
+
+        cfg = phonesync.load_config()
+        cfg["read_only"] = True
+        phonesync.save_config(cfg)
+        # Must not raise (no write method is called).
+        engine = harness.sync("a", adb_cls=NoWriteADB)
+        assert engine.stats["phone_writes_suppressed"] == 1
+
+
 class TestPartialPhoneMove:
     """If move_safe writes the destination but cannot remove the source,
     the move is PARTIAL: state must NOT advance to the new phone path, and

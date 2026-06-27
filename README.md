@@ -78,6 +78,8 @@ Photos are sorted by **year only** (`photos/YYYY/`), not `YYYY/MM`.
 | `phonesync sync` | Sync all connected phones |
 | `phonesync sync -d SERIAL` | Sync a specific phone by ADB serial |
 | `phonesync sync -n` / `--dry-run` | Preview without changing anything |
+| `phonesync sync --read-only` | Sync but never write to the phone (skip move propagation) |
+| `phonesync sync --overwrite-policy {ask,never,always}` | How to handle a file edited on both sides (overrides config for this run) |
 | `phonesync status` | Show config/data directories and per-device sync stats |
 | `phonesync devices` | List connected ADB devices and storage volumes |
 | `phonesync detect-paths` | Auto-detect media directories on connected phone(s) |
@@ -125,6 +127,10 @@ Edit `~/.phonesync/config.json`:
   "preserve_phone_subdirs": true,
   "verify_pulls": true,
   "use_library_index": true,
+  "read_only": false,
+  "check_free_space": true,
+  "free_space_margin_bytes": 104857600,
+  "overwrite_policy": "ask",
   "devices": {
     "SERIAL123": {
       "name": "pixel-8",
@@ -154,10 +160,24 @@ Edit `~/.phonesync/config.json`:
 | `preserve_phone_subdirs` | `true` | Mirror the phone's subfolder structure under `downloads/`/`recordings/` and under the photo year folder. |
 | `verify_pulls` | `true` | After each pull, compare the copied bytes against the phone's own hash and discard the copy if they differ. Catches truncated transfers. Leave on. |
 | `use_library_index` | `true` | Cache content hashes of the library so syncs are faster and an interrupted move is recognized instead of re-pulled. |
+| `read_only` | `false` | Never write to the phone — skips the move-propagation step entirely. Reads/ingest still happen. Useful for a first cautious sync. |
+| `check_free_space` | `true` | Before pulling, estimate the bytes to copy and abort (without copying anything) if they wouldn't fit. |
+| `free_space_margin_bytes` | `104857600` (100 MB) | Headroom required on top of the estimate before a sync proceeds. |
+| `overwrite_policy` | `"ask"` | What to do when a file was edited on **both** the phone and the computer since the last sync. `ask` prompts (and keeps local if there's no terminal); `never` always keeps your local edits; `always` always takes the phone version. Can be set per-file (see below). |
 | `exclude_dirs` | (built-in list) | Folder names to skip everywhere (`.thumbnails`, `.trash`, caches…). **This is how you tell PhoneSync to ignore files** — by location, not by content. |
 | `exclude_files` | (built-in list) | Filename patterns to skip (`.nomedia`, `Thumbs.db`…). |
 
 `exclude_dirs` and `exclude_files` default to built-in lists; add entries in the config to extend them.
+
+### Edited on both sides: overwrite protection
+
+Normally, if you edit a photo on the phone, the next sync re-pulls it and updates the computer copy. But if you *also* edited that file **on the computer** since the last sync (cropped it, fixed metadata, etc.), re-pulling would throw away your local edits. PhoneSync detects this — it compares the file's current on-disk hash against the hash it recorded at the last sync — and applies `overwrite_policy` only in that both-sides-changed case:
+
+- `ask` (default) — prompt you. The prompt offers *overwrite once*, *keep local once*, *always overwrite this file*, or *never overwrite this file*; the last two are remembered for that specific file. **If there's no terminal** (a cron/udev-triggered run), `ask` keeps your local edits rather than guessing — automation never silently destroys local work.
+- `never` — always keep your local edits; the phone version is not applied.
+- `always` — always take the phone version.
+
+Per-file choices ("always"/"never" from a prompt) are stored in that file's state entry as `overwrite_policy` and take precedence over the global setting. Files edited on only one side are unaffected — a phone-only change updates the computer copy as usual, and a computer-only change is just left alone.
 
 ### Reserved keys (not yet implemented)
 
@@ -194,6 +214,9 @@ If the same file is moved to different locations on both the phone and the compu
 - Pulls are verified against the phone's hash; a corrupt/truncated transfer is discarded and retried next sync.
 - Each device's state file is backed up (timestamped, last 10 kept) before every write.
 - If a phone becomes unreachable mid-scan, the run aborts loudly without saving state, rather than acting on a partial view that could mistreat files it couldn't see.
+- Before pulling, a free-space check estimates the copy and aborts up front if it wouldn't fit, instead of failing partway with files half-copied.
+- A file edited on both the phone and the computer is never silently overwritten; see [overwrite protection](#edited-on-both-sides-overwrite-protection). Automated (non-interactive) runs keep the local copy by default.
+- `read_only` / `--read-only` disables every phone-side write for a cautious sync.
 
 ## Running the tests
 
