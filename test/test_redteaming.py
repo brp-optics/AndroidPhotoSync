@@ -497,13 +497,18 @@ class TestRealADBTimeoutKwargs:
         stub = SubprocessStub()
         stub.respond(stdout="EXISTS\n")
         stub.respond(stdout="")
+        stub.respond(stdout="__PS_OK__\n")
         with stub:
             adb = phonesync.ADB("SER")
             assert adb.list_files_recursive("/sdcard/DCIM/Camera") == []
 
         assert stub.calls[0]["timeout"] == 120
         assert stub.calls[1]["timeout"] == 300
-
+        assert stub.calls[2]["timeout"] == 15
+        assert stub.calls[2]["cmd"] == [
+            "adb", "-s", "SER", "shell", "echo __PS_OK__"
+        ]
+    
     def test_list_connected_devices_uses_short_timeout(self):
         with SubprocessStub().respond(stdout="List of devices attached\n\n") as stub:
             assert phonesync.list_connected_devices() == []
@@ -521,6 +526,8 @@ class TestRealADBListFilesCommandConstruction:
         stub = SubprocessStub()
         stub.respond(stdout="EXISTS\n")
         stub.respond(stdout="")
+        stub.respond(stdout="__PS_OK__\n")
+        
         with stub:
             adb = phonesync.ADB("SER")
             adb.list_files_recursive(
@@ -530,6 +537,7 @@ class TestRealADBListFilesCommandConstruction:
                 max_depth=7,
             )
 
+        assert len(stub.calls) >= 3
         find_cmd = stub.calls[1]["cmd"][-1]
         assert "find '/sdcard/DCIM/My Camera' -maxdepth 7" in find_cmd
         assert "-name .thumbs -prune" in find_cmd
@@ -539,11 +547,15 @@ class TestRealADBListFilesCommandConstruction:
         assert "printf" in find_cmd
         assert "\\0" in find_cmd
         assert stub.calls[1]["timeout"] == 300
+        assert stub.calls[2]["cmd"][-1] == "echo __PS_OK__"
+        assert stub.calls[2]["timeout"] == 15
 
     def test_find_command_without_prune_is_simpler(self):
         stub = SubprocessStub()
         stub.respond(stdout="EXISTS\n")
         stub.respond(stdout="")
+        stub.respond(stdout="__PS_OK__\n")
+
         with stub:
             adb = phonesync.ADB("SER")
             adb.list_files_recursive(
@@ -553,10 +565,33 @@ class TestRealADBListFilesCommandConstruction:
                 max_depth=3,
             )
 
+        assert len(stub.calls) >= 3
         find_cmd = stub.calls[1]["cmd"][-1]
         assert "\\(" not in find_cmd
         assert "-maxdepth 3" in find_cmd
         assert "-type f" in find_cmd
+        assert "-exec sh -c" in find_cmd
+        assert "printf" in find_cmd
+        assert "\\0" in find_cmd
+        assert stub.calls[1]["timeout"] == 300
+        assert stub.calls[2]["cmd"][-1] == "echo __PS_OK__"
+        assert stub.calls[2]["timeout"] == 15
+    
+    def test_list_files_recursive_empty_find_unreachable_raises(self):
+        stub = SubprocessStub()
+        stub.respond(stdout="EXISTS\n")
+        stub.respond(stdout="")
+        stub.respond(stdout="")  # reachability probe does not return marker
+        with stub:
+            adb = phonesync.ADB("SER")
+            with pytest.raises(phonesync.ADBError):
+                adb.list_files_recursive("/sdcard/DCIM/Camera")
+
+        assert stub.calls[2]["cmd"] == [
+            "adb", "-s", "SER", "shell", "echo __PS_OK__"
+        ]
+        assert stub.calls[2]["timeout"] == 15
+        
 
 
 # ---------------------------------------------------------------------------
