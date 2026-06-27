@@ -205,6 +205,61 @@ def _atomic_json_write(path: Path, data: dict):
         raise
 
 
+def known_devices_path(cfg: dict) -> Path:
+    return Path(cfg["config_dir"]) / "known-devices.json"
+
+
+def load_known_devices(cfg: dict) -> dict:
+    """Load the registry of devices the user has approved for syncing.
+
+    Returns {serial: {"name": str, "approved_at": iso}}. A device must be
+    approved before its first (non-dry-run) sync — this both protects
+    against accidentally ingesting a huge library unprompted and scopes any
+    future auto-sync (#17) to devices the user has explicitly OK'd.
+    """
+    path = known_devices_path(cfg)
+    if not path.exists():
+        return {}
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        if isinstance(data, dict) and "devices" in data:
+            return data["devices"]
+    except (json.JSONDecodeError, OSError):
+        pass
+    return {}
+
+
+def save_known_devices(cfg: dict, devices: dict):
+    _atomic_json_write(known_devices_path(cfg),
+                       {"version": 1, "devices": devices})
+
+
+def is_device_known(cfg: dict, serial: str) -> bool:
+    return serial in load_known_devices(cfg)
+
+
+def approve_device(cfg: dict, serial: str, name: str = "") -> None:
+    """Add a device to the approved registry (idempotent)."""
+    devices = load_known_devices(cfg)
+    if serial not in devices:
+        devices[serial] = {
+            "name": name,
+            "approved_at": datetime.now().isoformat(),
+        }
+        save_known_devices(cfg, devices)
+
+
+def forget_device(cfg: dict, serial: str) -> bool:
+    """Remove a device from the approved registry. Returns True if removed."""
+    devices = load_known_devices(cfg)
+    if serial in devices:
+        del devices[serial]
+        save_known_devices(cfg, devices)
+        return True
+    return False
+
+
 class SyncLock:
     """File-based lock to prevent concurrent phonesync runs.
 
@@ -1038,6 +1093,7 @@ class SyncEngine:
         self.deleted_files = []  # [(relpath, category)] for deletion report
         self._scan_failed = False
         self._aborted_no_space = False
+        self._aborted_unconfirmed = False
         # Shared on-disk content index of the library (built in run()).
         self.library = LibraryIndex(self.data_dir, cfg)
         # Relpaths whose phone_path was updated by phone-side move detection
@@ -1193,6 +1249,15 @@ class SyncEngine:
             self._scan_failed = True
             return False
 
+        # First-time device confirmation (#5): a brand-new device must be
+        # explicitly approved before we pull anything. Interactive runs
+        # prompt; unattended runs refuse an unapproved device (which also
+        # scopes the future auto-sync service to known devices, #17).
+        # Skipped in dry-run, which writes nothing.
+        if not self.dry_run and not self._check_first_time_device():
+            self._aborted_unconfirmed = True
+            return False
+
         # Build the shared library content index once, before the phases.
         # Lets ingest skip pulling content that's already in the library
         # (first run against an existing library, and partial-move dups).
@@ -1300,6 +1365,97 @@ class SyncEngine:
             f"  Free-space check OK: need ~{_human_size(needed)}, "
             f"have {_human_size(free)}")
         return True
+
+    def _estimate_pull_count(self) -> int:
+        """Number of files phase 2 may pull (same filter as the byte
+        estimate). Used in the first-sync confirmation message."""
+        tracked_paths = {
+            info["phone_path"]
+            for info in self.state.files.values()
+            if info.get("device_name") == self.device_name
+            and not info.get("deleted_from_computer")
+        }
+        count = 0
+        for category, dir_scans in self.phone_scan.items():
+            for phone_dir, files in dir_scans:
+                for finfo in files:
+                    if not self._is_relevant_file(finfo["name"], category):
+                        continue
+                    if finfo["path"] in tracked_paths:
+                        continue
+                    count += 1
+        return count
+
+    def _device_has_state(self) -> bool:
+        """True if this device already has tracked files (it has synced
+        before, even if it predates the approved-devices registry)."""
+        return any(
+            info.get("device_name") == self.device_name
+            for info in self.state.files.values()
+        )
+
+    def _is_first_time_device(self) -> bool:
+        """True if this device has never been approved AND has no prior sync
+        state — i.e. a brand-new device that needs explicit confirmation."""
+        if is_device_known(self.cfg, self.device_serial):
+            return False
+        if self._device_has_state():
+            # Synced before this feature existed: treat as known and backfill
+            # the registry so future auto-sync scoping (#17) is accurate.
+            approve_device(self.cfg, self.device_serial, self.device_name)
+            return False
+        return True
+
+    def _confirm_first_sync(self) -> bool:
+        """Prompt to approve a brand-new device. Overridable in tests.
+        Only called when interactive."""
+        try:
+            est_bytes = self._estimate_pull_bytes()
+            est_count = self._estimate_pull_count()
+        except Exception:
+            est_bytes, est_count = 0, 0
+        print(f"\n  ⚠ First-time sync for device '{self.device_name}' "
+              f"(serial {self.device_serial}).")
+        print(f"    About to pull up to {est_count} file(s) "
+              f"({_human_size(est_bytes)}) into {self.data_dir}.")
+        print("    This device has not been synced before.")
+        try:
+            answer = input("    Proceed and remember this device? "
+                           "[y/N]: ").strip().lower()
+        except EOFError:
+            return False
+        return answer in ("y", "yes")
+
+    def _check_first_time_device(self) -> bool:
+        """Gate a first-time device behind explicit approval.
+
+        Returns True to proceed, False to abort. Interactive: prompt, and on
+        yes record the approval. Non-interactive: refuse (do NOT sync an
+        unapproved device unattended) and explain how to approve.
+        """
+        if not self._is_first_time_device():
+            return True
+
+        if self._is_interactive():
+            if self._confirm_first_sync():
+                approve_device(self.cfg, self.device_serial, self.device_name)
+                logging.info(
+                    f"  ✓ Device '{self.device_name}' approved for syncing.")
+                return True
+            logging.warning(
+                f"  Sync of '{self.device_name}' declined by user. "
+                f"Nothing was copied.")
+            return False
+
+        # Non-interactive (cron/udev/automation): never sync an unapproved
+        # device. This is also the scoping guard for the auto-sync service.
+        logging.error(
+            f"Device '{self.device_name}' ({self.device_serial}) is not "
+            f"approved for syncing, and there is no terminal to confirm.")
+        logging.error(
+            f"  Skipping. Approve it first with:  "
+            f"phonesync devices --approve {self.device_serial}")
+        return False
 
     def _is_interactive(self) -> bool:
         """True if we can prompt the user. False under cron/udev/automation
@@ -2385,16 +2541,39 @@ def cmd_status(args):
 
 
 def cmd_devices(args):
+    cfg = load_config()
+
+    # Manage the approved-devices registry (#5/#17) without syncing.
+    if getattr(args, "approve", None):
+        approve_device(cfg, args.approve)
+        print(f"✓ Approved device for syncing: {args.approve}")
+        return
+    if getattr(args, "forget", None):
+        if forget_device(cfg, args.forget):
+            print(f"✓ Removed device from approved list: {args.forget}")
+        else:
+            print(f"Device not in approved list: {args.forget}")
+        return
+
+    known = load_known_devices(cfg)
     devices = list_connected_devices()
     if not devices:
         print("No ADB devices connected.")
         print("Make sure USB debugging is enabled and the phone is plugged in.")
+        if known:
+            print("\nApproved devices (not currently connected):")
+            for serial, info in known.items():
+                print(f"  {serial}  {info.get('name', '')}")
         return
 
     for d in devices:
         serial = d["serial"]
         model = d["model"]
-        print(f"\n  {serial}  {model}")
+        status = "approved" if serial in known else "NOT approved"
+        print(f"\n  {serial}  {model}  [{status}]")
+        if serial not in known:
+            print(f"    First sync will ask for confirmation. Pre-approve "
+                  f"with: phonesync devices --approve {serial}")
 
         adb = ADB(serial)
         q = adb._q
@@ -2679,8 +2858,15 @@ def main():
     subparsers.add_parser("status", help="Show sync status")
 
     # devices
-    subparsers.add_parser(
+    p_devices = subparsers.add_parser(
         "devices", help="List connected ADB devices and storage volumes")
+    p_devices.add_argument(
+        "--approve", metavar="SERIAL",
+        help="Approve a device for syncing (skips the first-sync prompt; "
+             "required for unattended/auto-sync)")
+    p_devices.add_argument(
+        "--forget", metavar="SERIAL",
+        help="Remove a device from the approved list")
 
     # detect-paths
     p_detect = subparsers.add_parser(

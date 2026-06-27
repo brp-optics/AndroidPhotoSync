@@ -1152,6 +1152,178 @@ class TestComputerMoveDetails:
             b"DIFFERENT_CONTENT_BLOCKING"
 
 
+class TestFirstSyncConfirmation:
+    """A brand-new (unapproved) device must be explicitly confirmed before
+    its first non-dry-run sync. Unattended runs refuse an unapproved device.
+    This also scopes the future auto-sync service to known devices (#17)."""
+
+    def test_unapproved_noninteractive_aborts(self, harness, img_data):
+        harness.unapprove_device("a")
+        # Force non-interactive (automation).
+        orig = phonesync.SyncEngine._is_interactive
+        phonesync.SyncEngine._is_interactive = lambda self: False
+        try:
+            c, m = img_data("p", 2025, 1, 15)
+            harness.phone_write(
+                "a", "DCIM/Camera/IMG_20250115_001.jpg", c, m)
+            engine = harness.sync("a")
+        finally:
+            phonesync.SyncEngine._is_interactive = orig
+
+        assert engine.run_result is False
+        assert engine._aborted_unconfirmed is True
+        assert engine.stats["files_copied"] == 0
+        # Nothing pulled, no state saved, device still not approved.
+        assert not harness.computer_exists(
+            "photos/2025/IMG_20250115_001.jpg")
+        assert harness.state_file_count("a") == 0
+        assert harness.is_approved("a") is False
+
+    def test_interactive_yes_proceeds_and_approves(self, harness, img_data):
+        harness.unapprove_device("a")
+        orig_i = phonesync.SyncEngine._is_interactive
+        orig_c = phonesync.SyncEngine._confirm_first_sync
+        phonesync.SyncEngine._is_interactive = lambda self: True
+        phonesync.SyncEngine._confirm_first_sync = lambda self: True
+        try:
+            c, m = img_data("p", 2025, 1, 15)
+            harness.phone_write(
+                "a", "DCIM/Camera/IMG_20250115_001.jpg", c, m)
+            engine = harness.sync("a")
+        finally:
+            phonesync.SyncEngine._is_interactive = orig_i
+            phonesync.SyncEngine._confirm_first_sync = orig_c
+
+        assert engine.stats["files_copied"] == 1
+        assert harness.computer_exists(
+            "photos/2025/IMG_20250115_001.jpg")
+        # Device is now approved, so a later sync won't prompt.
+        assert harness.is_approved("a") is True
+
+    def test_interactive_no_aborts_without_approving(self, harness, img_data):
+        harness.unapprove_device("a")
+        orig_i = phonesync.SyncEngine._is_interactive
+        orig_c = phonesync.SyncEngine._confirm_first_sync
+        phonesync.SyncEngine._is_interactive = lambda self: True
+        phonesync.SyncEngine._confirm_first_sync = lambda self: False
+        try:
+            c, m = img_data("p", 2025, 1, 15)
+            harness.phone_write(
+                "a", "DCIM/Camera/IMG_20250115_001.jpg", c, m)
+            engine = harness.sync("a")
+        finally:
+            phonesync.SyncEngine._is_interactive = orig_i
+            phonesync.SyncEngine._confirm_first_sync = orig_c
+
+        assert engine.run_result is False
+        assert engine.stats["files_copied"] == 0
+        assert harness.is_approved("a") is False
+
+    def test_approved_device_not_prompted(self, harness, img_data):
+        """A pre-approved device (the harness default) never prompts."""
+        called = {"n": 0}
+
+        def tracking_confirm(self):
+            called["n"] += 1
+            return True
+
+        orig = phonesync.SyncEngine._confirm_first_sync
+        phonesync.SyncEngine._confirm_first_sync = tracking_confirm
+        try:
+            c, m = img_data("p", 2025, 1, 15)
+            harness.phone_write(
+                "a", "DCIM/Camera/IMG_20250115_001.jpg", c, m)
+            engine = harness.sync("a")
+        finally:
+            phonesync.SyncEngine._confirm_first_sync = orig
+
+        assert called["n"] == 0
+        assert engine.stats["files_copied"] == 1
+
+    def test_second_sync_not_prompted_after_approval(self, harness, img_data):
+        """Once approved on first sync, subsequent syncs don't prompt."""
+        harness.unapprove_device("a")
+        called = {"n": 0}
+
+        def counting_confirm(self):
+            called["n"] += 1
+            return True
+
+        orig_i = phonesync.SyncEngine._is_interactive
+        orig_c = phonesync.SyncEngine._confirm_first_sync
+        phonesync.SyncEngine._is_interactive = lambda self: True
+        phonesync.SyncEngine._confirm_first_sync = counting_confirm
+        try:
+            c, m = img_data("p", 2025, 1, 15)
+            harness.phone_write(
+                "a", "DCIM/Camera/IMG_20250115_001.jpg", c, m)
+            harness.sync("a")          # prompts once, approves
+            harness.phone_write(
+                "a", "DCIM/Camera/IMG_20250116_002.jpg",
+                *img_data("q", 2025, 1, 16))
+            harness.sync("a")          # must NOT prompt again
+        finally:
+            phonesync.SyncEngine._is_interactive = orig_i
+            phonesync.SyncEngine._confirm_first_sync = orig_c
+
+        assert called["n"] == 1
+
+    def test_dry_run_does_not_require_approval(self, harness, img_data):
+        """Dry-run writes nothing, so it never gates on approval and never
+        approves the device."""
+        harness.unapprove_device("a")
+        orig = phonesync.SyncEngine._is_interactive
+        phonesync.SyncEngine._is_interactive = lambda self: False
+        try:
+            c, m = img_data("p", 2025, 1, 15)
+            harness.phone_write(
+                "a", "DCIM/Camera/IMG_20250115_001.jpg", c, m)
+            engine = harness.sync("a", dry_run=True)
+        finally:
+            phonesync.SyncEngine._is_interactive = orig
+
+        assert engine._aborted_unconfirmed is False
+        # Dry-run must not silently approve the device.
+        assert harness.is_approved("a") is False
+
+    def test_existing_state_device_backfilled_not_prompted(self, harness,
+                                                           img_data):
+        """A device with prior sync state but missing from the registry
+        (upgrade migration) is treated as known and backfilled, not
+        prompted."""
+        # Approved sync to create state, then forget the approval but KEEP
+        # state — simulating an upgrade from before the registry existed.
+        c, m = img_data("p", 2025, 1, 15)
+        harness.phone_write("a", "DCIM/Camera/IMG_20250115_001.jpg", c, m)
+        harness.sync("a")
+        assert harness.state_file_count("a") >= 1
+        harness.unapprove_device("a")
+
+        called = {"n": 0}
+
+        def counting_confirm(self):
+            called["n"] += 1
+            return True
+
+        orig_i = phonesync.SyncEngine._is_interactive
+        orig_c = phonesync.SyncEngine._confirm_first_sync
+        phonesync.SyncEngine._is_interactive = lambda self: False
+        phonesync.SyncEngine._confirm_first_sync = counting_confirm
+        try:
+            harness.phone_write(
+                "a", "DCIM/Camera/IMG_20250116_002.jpg",
+                *img_data("q", 2025, 1, 16))
+            engine = harness.sync("a")
+        finally:
+            phonesync.SyncEngine._is_interactive = orig_i
+            phonesync.SyncEngine._confirm_first_sync = orig_c
+
+        assert called["n"] == 0
+        assert engine._aborted_unconfirmed is False
+        # Backfilled into the registry for #17 scoping.
+        assert harness.is_approved("a") is True
+
+
 class TestOverwriteProtection:
     """When a file is edited on BOTH the phone and the computer since the
     last sync, the phone version must not silently clobber the local edits.

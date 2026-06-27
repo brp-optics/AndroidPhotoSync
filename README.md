@@ -64,6 +64,7 @@ Data and configuration live in **two separate directories**:
 ~/.phonesync/                      ← config directory
 ├── config.json
 ├── library-index.json             ← cached content hashes of the library
+├── known-devices.json             ← devices you've approved for syncing
 ├── state-pixel-8.json             ← per-device sync state
 ├── state-galaxy-s24.json
 └── state-backups/                 ← timestamped state backups (last 10)
@@ -81,7 +82,9 @@ Photos are sorted by **year only** (`photos/YYYY/`), not `YYYY/MM`.
 | `phonesync sync --read-only` | Sync but never write to the phone (skip move propagation) |
 | `phonesync sync --overwrite-policy {ask,never,always}` | How to handle a file edited on both sides (overrides config for this run) |
 | `phonesync status` | Show config/data directories and per-device sync stats |
-| `phonesync devices` | List connected ADB devices and storage volumes |
+| `phonesync devices` | List connected ADB devices, storage volumes, and approval status |
+| `phonesync devices --approve SERIAL` | Pre-approve a device for syncing (needed for unattended/auto-sync) |
+| `phonesync devices --forget SERIAL` | Remove a device from the approved list |
 | `phonesync detect-paths` | Auto-detect media directories on connected phone(s) |
 | `phonesync detect-paths --apply` | Apply detected paths to the config |
 | `phonesync config` | Show current config |
@@ -98,6 +101,8 @@ Add `-v` / `--verbose` for debug logging. `sync` exits non-zero if a device scan
 
 ### 1. Initial sync
 Plug in the phone and run `sync`; PhoneSync copies all photos, downloads, and recordings to the computer.
+
+The **first** time you sync a given device, PhoneSync pauses and asks you to confirm before pulling anything — showing the device and roughly how many files (and how much data) it's about to copy. This is a guard against accidentally ingesting a huge library from the wrong device. Once you confirm, the device is remembered (in `known-devices.json`) and won't ask again. If there's no terminal to prompt at (an unattended/automated run), an unapproved device is **skipped rather than synced** — approve it ahead of time with `phonesync devices --approve SERIAL`.
 
 ### 2. Sort on the computer
 Move photos into subfolders however you like:
@@ -216,6 +221,7 @@ If the same file is moved to different locations on both the phone and the compu
 - If a phone becomes unreachable mid-scan, the run aborts loudly without saving state, rather than acting on a partial view that could mistreat files it couldn't see.
 - Before pulling, a free-space check estimates the copy and aborts up front if it wouldn't fit, instead of failing partway with files half-copied.
 - A file edited on both the phone and the computer is never silently overwritten; see [overwrite protection](#edited-on-both-sides-overwrite-protection). Automated (non-interactive) runs keep the local copy by default.
+- A brand-new device must be explicitly approved before its first sync; unattended runs refuse to sync an unapproved device (which also scopes any auto-sync to devices you've OK'd).
 - `read_only` / `--read-only` disables every phone-side write for a cautious sync.
 
 ## Running the tests
@@ -231,7 +237,7 @@ The tests use a local-filesystem fake for ADB, so no phone is needed. The runner
 
 These are described here as goals, not current behavior:
 
-- **Auto-sync on plug-in** — a udev rule + systemd service to run `sync` automatically when a phone is connected. (No installer, udev rule, or service unit ships today; run `sync` manually for now.)
+- **Auto-sync on plug-in** — a udev rule + systemd service to run `sync` automatically when a phone is connected. (No installer, udev rule, or service unit ships today; run `sync` manually for now.) The approved-devices registry already provides the key safety scoping: an unattended sync only touches devices you've approved with `phonesync devices --approve`.
 - **`phonesync doctor`** — verify that the phone's `find`/`stat`/`printf` scan command behaves as expected on the device's toybox before trusting a large sync.
 - The reserved config keys listed above.
 
