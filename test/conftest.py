@@ -208,10 +208,30 @@ class FakeADB:
             if "ro.product.model" in cmd:
                 return self.model
             return ""
+        if cmd.startswith("echo "):
+            # Bare `echo TEXT` (no redirect) — used by the doctor probe.
+            return cmd[len("echo "):].strip()
+        if cmd.startswith("printf ") and ">" in cmd:
+            # `printf 'CONTENT' > /path` — write a file (doctor probe).
+            return self._shell_printf_write(cmd)
         if cmd.startswith("ls "):
             return self._shell_ls(cmd)
         raise NotImplementedError(
             f"FakeADB.shell() does not support command: {cmd!r}")
+
+    def _shell_printf_write(self, cmd):
+        # Parse: printf 'CONTENT' > /remote/path
+        body = cmd[len("printf "):]
+        gt = body.rfind(">")
+        content_part = body[:gt].strip()
+        path_part = body[gt + 1:].strip()
+        # Strip surrounding quotes from content and path.
+        content = content_part.strip().strip("'\"")
+        remote = self._unquote(path_part)
+        local = self._local(remote)
+        local.parent.mkdir(parents=True, exist_ok=True)
+        local.write_text(content)
+        return ""
 
     def _shell_piped(self, cmd, check, timeout):
         parts = cmd.split("|", 1)

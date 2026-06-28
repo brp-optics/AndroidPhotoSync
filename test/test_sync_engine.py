@@ -451,6 +451,104 @@ class TestMoveCandidateDisambiguation:
 # and persists a content cache. (keep_duplicates was removed.)
 # ---------------------------------------------------------------------------
 
+class TestDoctor:
+    """`phonesync doctor` probes on-device shell capabilities. We can't test
+    against real toybox here, but we can verify the orchestration: all-pass,
+    and that each injected capability failure is detected and flagged
+    critical/non-critical correctly. (TODO item H.)"""
+
+    def _results_by_name(self, results):
+        return {r["name"]: r for r in results}
+
+    def test_all_pass(self, harness):
+        from conftest import FakeADB
+        res = phonesync.run_doctor(
+            FakeADB("SERIAL_A"), harness.cfg, want_phone_writes=True)
+        assert all(r["ok"] for r in res)
+        names = [r["name"] for r in res]
+        assert any("recursive scan" in n for n in names)
+        assert any("sha256sum" in n for n in names)
+
+    def test_detects_dead_shell(self, harness):
+        from conftest import FakeADB
+
+        class DeadADB(FakeADB):
+            def shell(self, cmd, check=True, timeout=120):
+                if cmd.startswith("echo "):
+                    return ""   # shell echoes nothing back
+                return super().shell(cmd, check=check, timeout=timeout)
+
+        res = phonesync.run_doctor(DeadADB("SERIAL_A"), harness.cfg)
+        # A dead shell short-circuits: only the reachability probe runs.
+        assert res[0]["name"] == "adb shell reachable"
+        assert res[0]["ok"] is False
+        assert res[0]["critical"] is True
+        assert len(res) == 1
+
+    def test_detects_broken_stat(self, harness):
+        from conftest import FakeADB
+
+        class BadStatADB(FakeADB):
+            def shell(self, cmd, check=True, timeout=120):
+                if cmd.startswith("stat -c "):
+                    return "not-a-number"
+                return super().shell(cmd, check=check, timeout=timeout)
+
+        res = phonesync.run_doctor(BadStatADB("SERIAL_A"), harness.cfg)
+        stat_r = self._results_by_name(res)["stat -c %s / %Y"]
+        assert stat_r["ok"] is False
+        assert stat_r["critical"] is True
+
+    def test_detects_broken_sha256(self, harness):
+        from conftest import FakeADB
+
+        class NoShaADB(FakeADB):
+            def file_hash(self, remote_path):
+                return None   # sha256sum unavailable / failed
+
+        res = phonesync.run_doctor(NoShaADB("SERIAL_A"), harness.cfg)
+        sha = self._results_by_name(res)["sha256sum"]
+        assert sha["ok"] is False
+        assert sha["critical"] is True
+
+    def test_cp_failure_critical_only_with_writes(self, harness):
+        from conftest import FakeADB
+
+        class NoCpADB(FakeADB):
+            def shell(self, cmd, check=True, timeout=120):
+                if cmd.startswith("cp "):
+                    return ""   # cp silently does nothing
+                return super().shell(cmd, check=check, timeout=timeout)
+
+        # With phone writes OFF, a cp failure is informational (not critical).
+        res_off = phonesync.run_doctor(
+            NoCpADB("SERIAL_A"), harness.cfg, want_phone_writes=False)
+        cp_off = self._results_by_name(res_off)["cp (phone writes)"]
+        assert cp_off["ok"] is False
+        assert cp_off["critical"] is False
+
+        # With phone writes ON, the same failure IS critical.
+        res_on = phonesync.run_doctor(
+            NoCpADB("SERIAL_A"), harness.cfg, want_phone_writes=True)
+        cp_on = self._results_by_name(res_on)["cp (phone writes)"]
+        assert cp_on["ok"] is False
+        assert cp_on["critical"] is True
+
+    def test_detects_unsafe_scan(self, harness):
+        """If the recursive scan can't round-trip a newline filename, that's
+        a critical failure (the #11 NUL-safety guarantee is broken)."""
+        from conftest import FakeADB
+
+        class BadScanADB(FakeADB):
+            def list_files_recursive(self, *a, **k):
+                return []   # scan returns nothing despite a file being there
+
+        res = phonesync.run_doctor(BadScanADB("SERIAL_A"), harness.cfg)
+        scan = [r for r in res if "recursive scan" in r["name"]][0]
+        assert scan["ok"] is False
+        assert scan["critical"] is True
+
+
 class TestRecover:
     """`phonesync recover`: list tombstones/backups, restore a state backup
     (reversibly), and rebuild the library index. (TODO item I.)"""

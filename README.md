@@ -92,6 +92,7 @@ Photos are sorted by **year only** (`photos/YYYY/`), not `YYYY/MM`.
 | `phonesync devices` | List connected ADB devices, storage volumes, and approval status |
 | `phonesync devices --approve SERIAL` | Pre-approve a device for syncing (needed for unattended/auto-sync) |
 | `phonesync devices --forget SERIAL` | Remove a device from the approved list |
+| `phonesync doctor [-d SERIAL]` | Probe on-device shell capabilities (find/stat/printf/sha256sum/cp) before trusting a real sync |
 | `phonesync detect-paths` | Auto-detect media directories on connected phone(s) |
 | `phonesync detect-paths --apply` | Apply detected paths to the config |
 | `phonesync config` | Show current config |
@@ -261,6 +262,16 @@ uv run pytest                 # or: pytest -q
 The tests use a local-filesystem fake for ADB, so no phone is needed. A `pytest_configure` hook refuses to run as root, because root bypasses the file-permission bits that some tests rely on (running as root would turn those into false passes).
 
 A bundled `run_tests.py` still works as a no-dependency fallback for environments without pytest, but it's **deprecated** and doesn't support all pytest features — prefer `pytest`.
+
+### Checking a new phone first
+
+Android's userland (toybox/busybox) varies between builds, and PhoneSync leans on specific shell behavior — `find` with `-prune`/`-exec`, `stat -c`, `printf` with NUL separators, `sha256sum`, and (when phone writes are on) `cp`. Before trusting a sync against a large or important library on a phone you haven't used before, run:
+
+```bash
+phonesync doctor              # or -d SERIAL for one device
+```
+
+It runs each of those commands against a throwaway directory on the phone — including a scan of a file whose name contains a newline, to confirm the NUL-safe scanner works — and reports pass/fail. If a critical check fails it exits non-zero, which is your signal not to rely on automated syncing for that device yet. Write checks (`cp`) are only treated as critical when phone writes are enabled.
 
 ### Reviewing a plan before a real sync
 

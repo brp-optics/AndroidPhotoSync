@@ -3207,6 +3207,179 @@ def cmd_prune_state(args):
         print(f"  Final entries:      {len(state.files)}")
 
 
+def run_doctor(adb, cfg, want_phone_writes=False, device_name=""):
+    """Probe the on-device shell capabilities phonesync relies on, using the
+    SAME commands the sync uses, against a temp dir on the phone. Returns a
+    list of result dicts: {name, ok, critical, detail}.
+
+    Android userland is toybox/busybox, which varies across builds; a missing
+    or differently-behaving find/stat/printf/sha256sum can cause silent
+    empty scans, skipped pulls, or failed move propagation. This catches that
+    before trusting a real library. (TODO item H, absorbs old #15.)
+
+    `adb` is an ADB-like instance (real or a test double). Probes that would
+    write to the phone (mkdir/cp/mv/rm) are marked critical only when
+    want_phone_writes is True (move propagation enabled); read/scan probes are
+    always critical.
+    """
+    results = []
+
+    def record(name, ok, critical, detail=""):
+        results.append({"name": name, "ok": bool(ok), "critical": critical,
+                        "detail": detail})
+
+    q = adb._q
+    # A temp working dir on the phone. Under /sdcard so it's writable and on
+    # the same volume the tool reads from.
+    probe_dir = "/sdcard/.phonesync-doctor"
+    # A filename containing a NEWLINE, to exercise the NUL-separated scanner
+    # format (#11): if find/printf mangle this, the scan is unsafe.
+    tricky_name = "doctor probe\nline2.txt"
+    tricky_path = f"{probe_dir}/{tricky_name}"
+
+    # 1. adb reachable / shell works at all.
+    try:
+        echoed = adb.shell("echo PHONESYNC_OK", check=False).strip()
+        reachable = "PHONESYNC_OK" in echoed
+        record("adb shell reachable", reachable, True,
+               "" if reachable else f"got: {echoed!r}")
+    except Exception as e:
+        record("adb shell reachable", False, True, str(e))
+        reachable = False
+    if not reachable:
+        # A shell that can't even echo is unusable; the rest would be noise.
+        return results
+
+    # 2. mkdir -p (needed to create dirs for pulls/moves; also our probe dir).
+    made = False
+    try:
+        adb.shell(f"mkdir -p {q(probe_dir)}", check=False)
+        made = "EXISTS" in adb.shell(
+            f"[ -d {q(probe_dir)} ] && echo EXISTS || echo MISSING",
+            check=False)
+        record("mkdir -p", made, want_phone_writes,
+               "" if made else "could not create probe dir")
+    except Exception as e:
+        record("mkdir -p", False, want_phone_writes, str(e))
+
+    if not made:
+        # Can't run file-level probes without the probe dir.
+        return results
+
+    # Create the tricky-named test file (write via the phone shell, using a
+    # redirect; if this fails we still try the rest).
+    try:
+        adb.shell(f"printf 'hello' > {q(tricky_path)}", check=False)
+    except Exception:
+        pass
+    file_there = "EXISTS" in adb.shell(
+        f"[ -e {q(tricky_path)} ] && echo EXISTS || echo MISSING",
+        check=False)
+
+    # 3. stat -c %s / %Y (size + mtime; the scan depends on both).
+    try:
+        size = adb.shell(f'stat -c %s {q(tricky_path)}', check=False).strip()
+        mtime = adb.shell(f'stat -c %Y {q(tricky_path)}', check=False).strip()
+        ok = size.isdigit() and mtime.isdigit()
+        record("stat -c %s / %Y", ok, True,
+               "" if ok else f"size={size!r} mtime={mtime!r}")
+    except Exception as e:
+        record("stat -c %s / %Y", False, True, str(e))
+
+    # 4. The NUL-separated recursive scanner on a newline-containing filename.
+    #    This is the real list_files_recursive path (#11) — the strongest
+    #    single check that find + printf + stat cooperate safely.
+    try:
+        listed = adb.list_files_recursive(probe_dir)
+        names = [e["name"] for e in listed]
+        ok = tricky_name in names
+        record("recursive scan (NUL-safe, newline filename)", ok, True,
+               "" if ok else f"scanned names={names!r}")
+    except Exception as e:
+        record("recursive scan (NUL-safe, newline filename)", False, True,
+               str(e))
+
+    # 5. sha256sum (pull verification + move/library hashing depend on it).
+    try:
+        h = adb.file_hash(tricky_path)
+        ok = bool(h) and len(h) == 64
+        record("sha256sum", ok, True,
+               "" if ok else f"got hash={h!r}")
+    except Exception as e:
+        record("sha256sum", False, True, str(e))
+
+    # 6. cp (only used when phone writes are enabled, for move propagation).
+    try:
+        cp_dst = f"{probe_dir}/doctor-cp-copy.txt"
+        adb.shell(f"cp {q(tricky_path)} {q(cp_dst)}", check=False)
+        ok = "EXISTS" in adb.shell(
+            f"[ -e {q(cp_dst)} ] && echo EXISTS || echo MISSING",
+            check=False)
+        record("cp (phone writes)", ok, want_phone_writes,
+               "" if ok else "copy did not appear")
+    except Exception as e:
+        record("cp (phone writes)", False, want_phone_writes, str(e))
+
+    # Cleanup: best-effort remove the probe dir.
+    try:
+        adb.shell(f"rm -rf {q(probe_dir)}", check=False)
+    except Exception:
+        pass
+
+    return results
+
+
+def cmd_doctor(args):
+    cfg = load_config()
+    want_writes = not cfg.get("read_only", True)
+
+    if args.device:
+        serials = [args.device]
+    else:
+        devices = list_connected_devices()
+        if not devices:
+            print("No ADB devices connected.")
+            print("Connect a phone with USB debugging enabled.")
+            sys.exit(1)
+        serials = [d["serial"] for d in devices]
+
+    overall_ok = True
+    for serial in serials:
+        engine_adb = ADB(serial)
+        try:
+            name = engine_adb.get_model()
+        except Exception:
+            name = serial
+        print(f"\nphonesync doctor — {name} ({serial})")
+        if want_writes:
+            print("  (phone writes ENABLED — checking write capabilities "
+                  "as critical)")
+        else:
+            print("  (phone writes off — write checks are informational)")
+
+        results = run_doctor(engine_adb, cfg, want_phone_writes=want_writes,
+                             device_name=name)
+        for r in results:
+            mark = "✓" if r["ok"] else ("✗" if r["critical"] else "•")
+            line = f"  {mark} {r['name']}"
+            if r["detail"]:
+                line += f"  — {r['detail']}"
+            print(line)
+            if not r["ok"] and r["critical"]:
+                overall_ok = False
+
+        crit_fail = [r for r in results
+                     if not r["ok"] and r["critical"]]
+        if crit_fail:
+            print(f"  RESULT: {len(crit_fail)} critical check(s) failed — "
+                  f"this device may not sync reliably.")
+        else:
+            print("  RESULT: all critical checks passed.")
+
+    if not overall_ok:
+        sys.exit(2)
+
+
 def _state_paths_for(cfg, target_device):
     """Yield (name, state_path) for the target device or all devices."""
     cfg_dir = Path(cfg["config_dir"])
@@ -3504,6 +3677,14 @@ def main():
     # status
     subparsers.add_parser("status", help="Show sync status")
 
+    # doctor
+    p_doctor = subparsers.add_parser(
+        "doctor",
+        help="Probe on-device shell capabilities phonesync relies on "
+             "(find/stat/printf/sha256sum/cp) before trusting a real sync")
+    p_doctor.add_argument(
+        "-d", "--device", help="ADB device serial (default: all connected)")
+
     # adopt-existing
     p_adopt = subparsers.add_parser(
         "adopt-existing",
@@ -3604,6 +3785,8 @@ def main():
         cmd_sync(args)
     elif args.command == "adopt-existing":
         cmd_adopt_existing(args)
+    elif args.command == "doctor":
+        cmd_doctor(args)
     elif args.command == "status":
         cmd_status(args)
     elif args.command == "devices":
