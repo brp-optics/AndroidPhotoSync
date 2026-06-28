@@ -83,6 +83,10 @@ Photos are sorted by **year only** (`photos/YYYY/`), not `YYYY/MM`.
 | `phonesync sync -n` / `--dry-run` | Preview without changing anything |
 | `phonesync sync --read-only` | Sync with no phone writes (this is the default) |
 | `phonesync sync --apply-phone-moves` | Enable phone writes for this run: propagate computer-side moves to the phone (alias `--allow-phone-writes`) |
+| `phonesync sync --dry-run --plan` | Print a structured, reviewable plan of what the run would do |
+| `phonesync sync --dry-run --plan-json FILE` | Write the plan as JSON to `FILE` (`-` for stdout) for automated review |
+| `phonesync sync --dry-run --plan --details moves` | Limit the plan to one record kind (`moves`, `ingest`, `deletions`, `conflicts`) |
+| `phonesync adopt-existing [-d SERIAL] [-n]` | Map phone files already present in the library to the existing copy instead of importing duplicates (for a pre-existing library) |
 | `phonesync sync --overwrite-policy {ask,never,always}` | How to handle a file edited on both sides (overrides config for this run) |
 | `phonesync status` | Show config/data directories and per-device sync stats |
 | `phonesync devices` | List connected ADB devices, storage volumes, and approval status |
@@ -97,15 +101,23 @@ Photos are sorted by **year only** (`photos/YYYY/`), not `YYYY/MM`.
 | `phonesync prune-state` | Remove stale state entries (keeps tombstones) |
 | `phonesync prune-state --clear-tombstones` | Also drop tombstones (deleted files will re-download) |
 | `phonesync prune-state --rehash` | Recompute file hashes (slow but thorough) |
+| `phonesync recover --list-tombstones` | List files deleted on the computer (won't be re-downloaded) |
+| `phonesync recover --list-conflicts` | List unresolved move conflicts from the last run |
+| `phonesync recover --list-partial-moves` | List partial moves from the last run (file left at both phone paths) |
+| `phonesync recover --list-backups` | List available state backups |
+| `phonesync recover --restore-backup NAME` | Restore a state backup (current state is snapshotted first); `NAME` is a filename or unique timestamp substring |
+| `phonesync recover --rebuild-index` | Rebuild the library content index from scratch |
 
 Add `-v` / `--verbose` for debug logging. `sync` exits non-zero if a device scan fails mid-run.
+
+Progress and diagnostics are written to **stderr** and stream live (line-buffered), so you can watch a long sync in real time or pipe it to a log: `phonesync sync 2> sync.log`, or `phonesync sync 2>&1 | tee sync.log`. Stdout is kept clean for any future machine-readable output.
 
 ## Workflow
 
 ### 1. Initial sync
 Plug in the phone and run `sync`; PhoneSync copies all photos, downloads, and recordings to the computer.
 
-The **first** time you sync a given device, PhoneSync pauses and asks you to confirm before pulling anything — showing the device and roughly how many files (and how much data) it's about to copy. This is a guard against accidentally ingesting a huge library from the wrong device. Once you confirm, the device is remembered (in `known-devices.json`) and won't ask again. If there's no terminal to prompt at (an unattended/automated run), an unapproved device is **skipped rather than synced** — approve it ahead of time with `phonesync devices --approve SERIAL`.
+The **first** time you sync a given device, PhoneSync pauses and asks you to confirm before pulling anything — showing the device and roughly how many files (and how much data) it's about to copy. This is a guard against accidentally ingesting a huge library from the wrong device. Once you confirm, the device is remembered (in `known-devices.json`) and won't ask again. If there's no terminal to prompt at (an unattended/automated run), an unapproved device is **skipped rather than synced** — and it's refused *before the phone is scanned at all*, so an unknown device plugged into an automated setup is never even enumerated. Approve it ahead of time with `phonesync devices --approve SERIAL`.
 
 ### 2. Sort on the computer
 Move photos into subfolders however you like:
@@ -214,6 +226,17 @@ Content hashes (SHA256) are still recorded, but only to do safe work that never 
 - **Pull verification** — confirming each pulled file matches the phone's own hash, catching truncated transfers.
 - **Completing an interrupted move** — if a move to the phone half-finished on a previous run, the leftover copy is recognized instead of being re-pulled as a "new" file.
 
+#### Pointing at a library you already have
+
+Because every copy is kept, a *first* sync against a directory that already holds your photos would import a second copy of each file that's already there — the tool has no record of them yet, so it treats the phone's copies as new. If you're pointing PhoneSync at an existing main library, run this first:
+
+```bash
+phonesync adopt-existing -d SERIAL --dry-run   # preview what would be adopted
+phonesync adopt-existing -d SERIAL             # record the mappings
+```
+
+For every phone file whose **content** already exists somewhere in the library, `adopt-existing` records a state mapping to that existing file and does **not** pull a duplicate. Files not already present are left untouched for a normal `sync`. It never pulls bytes and never writes to the phone. Afterward, run `sync` as usual. (Alternatively, point the first sync at an empty directory and merge later.)
+
 ### Move detection
 Each sync, PhoneSync checks whether files it previously synced still exist at their expected phone paths. If a tracked file is gone from its path but its content is found at another path, that's recorded as a move (the file isn't re-downloaded). When several untracked copies share the same content, the tool uses filename and modification-time hints to pick the move target, and refuses to guess if they're genuinely ambiguous.
 
@@ -232,11 +255,24 @@ If the same file is moved to different locations on both the phone and the compu
 ## Running the tests
 
 ```bash
-uv run pytest                 # via pytest
-python3 run_tests.py          # or the bundled runner (must NOT be run as root)
+uv run pytest                 # or: pytest -q
 ```
 
-The tests use a local-filesystem fake for ADB, so no phone is needed. The runner refuses to run as root because root bypasses the file-permission bits that some tests rely on.
+The tests use a local-filesystem fake for ADB, so no phone is needed. A `pytest_configure` hook refuses to run as root, because root bypasses the file-permission bits that some tests rely on (running as root would turn those into false passes).
+
+A bundled `run_tests.py` still works as a no-dependency fallback for environments without pytest, but it's **deprecated** and doesn't support all pytest features — prefer `pytest`.
+
+### Reviewing a plan before a real sync
+
+`--plan` turns a dry run into a structured, reviewable summary instead of a scroll of log lines — useful before trusting a sync against a main library, and essential for automation where logs are the only review surface:
+
+```bash
+phonesync sync --dry-run --plan
+phonesync sync --dry-run --plan-json /tmp/plan.json   # machine-readable; - for stdout
+phonesync sync --dry-run --plan --details moves       # just the phone-side moves
+```
+
+Each phone-move record carries the fields you need to judge whether the move is safe — `source_exists`, `dest_exists`, and `would_remove_old_phone_path` — so you can see exactly which old phone paths a real run would remove before letting it. The human plan prints to stderr; `--plan-json` writes machine-readable JSON (records of kind `ingest`, `phone_move`, `partial_move`, `deletion`, `conflict`).
 
 ## Planned / not yet implemented
 

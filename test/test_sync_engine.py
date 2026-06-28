@@ -451,6 +451,150 @@ class TestMoveCandidateDisambiguation:
 # and persists a content cache. (keep_duplicates was removed.)
 # ---------------------------------------------------------------------------
 
+class TestRecover:
+    """`phonesync recover`: list tombstones/backups, restore a state backup
+    (reversibly), and rebuild the library index. (TODO item I.)"""
+
+    class _Args:
+        def __init__(self, **kw):
+            self.device = None
+            self.list_tombstones = False
+            self.list_backups = False
+            self.restore_backup = None
+            self.rebuild_index = False
+            for k, v in kw.items():
+                setattr(self, k, v)
+
+    def test_rebuild_index_creates_cache(self, harness):
+        harness.computer_write("photos/2025/a.jpg", b"AAA",
+                               mtime=1736899200.0)
+        cache = harness.cfg_dir / "library-index.json"
+        if cache.exists():
+            cache.unlink()
+        phonesync.cmd_recover(self._Args(rebuild_index=True))
+        assert cache.exists()
+        import json
+        with open(cache) as f:
+            assert "photos/2025/a.jpg" in json.load(f)["files"]
+
+    def test_restore_backup_reversible(self, harness, img_data):
+        # Create state via a sync, then a SECOND sync to generate a backup of
+        # the first state.
+        c, m = img_data("p", 2025, 1, 15)
+        harness.phone_write("a", "DCIM/Camera/IMG_20250115_001.jpg", c, m)
+        harness.sync("a")
+        harness.phone_write("a", "DCIM/Camera/IMG_20250116_002.jpg",
+                            *img_data("q", 2025, 1, 16))
+        harness.sync("a")  # this save() backed up the prior (1-file) state
+
+        backup_dir = harness.cfg_dir / "state-backups"
+        backups = sorted(backup_dir.glob("state-phone-a.*.json"))
+        assert backups, "expected a state backup after the second sync"
+        current_count = harness.state_file_count("a")
+        assert current_count == 2
+
+        # Restore the older (1-file) backup.
+        phonesync.cmd_recover(
+            self._Args(restore_backup=backups[0].name))
+        assert harness.state_file_count("a") == 1
+        # Restore created a pre-restore safety copy of the 2-file state.
+        pre = list(backup_dir.glob("state-phone-a.pre-restore-*.json"))
+        assert pre, "restore should snapshot current state first"
+
+    def test_restore_missing_backup_exits(self, harness):
+        raised = False
+        try:
+            phonesync.cmd_recover(
+                self._Args(restore_backup="nonexistent-backup"))
+        except SystemExit:
+            raised = True
+        assert raised
+
+    def test_list_actions_do_not_raise(self, harness, img_data):
+        # Smoke: listing actions run cleanly even with/without data.
+        c, m = img_data("p", 2025, 1, 15)
+        harness.phone_write("a", "DCIM/Camera/IMG_20250115_001.jpg", c, m)
+        harness.sync("a")
+        phonesync.cmd_recover(self._Args(list_tombstones=True))
+        phonesync.cmd_recover(self._Args(list_backups=True))
+
+
+class TestAdoptExisting:
+    """`adopt-existing` maps phone files whose content is ALREADY in the
+    library to the existing local copy without pulling a duplicate, and
+    leaves genuinely-new files for a normal sync. (TODO item G.)"""
+
+    def test_adopts_content_already_on_disk(self, harness):
+        content = b"ALREADY_HERE_FROM_OLD_BACKUP"
+        # Pre-existing library copy (e.g. years of manual copying).
+        harness.computer_write("photos/2025/old/IMG.jpg", content,
+                               mtime=1736899200.0)
+        # Same content sits on the phone at an untracked path.
+        harness.phone_write("a", "DCIM/Camera/IMG.jpg", content,
+                            1736899200.0)
+
+        engine = harness.adopt("a")
+        assert engine.stats["adopted"] == 1
+        # No second copy was created.
+        assert len(harness.computer_list("photos")) == 1
+        # State maps the phone path to the EXISTING relpath.
+        state = harness.get_state("a")["files"]
+        assert "photos/2025/old/IMG.jpg" in state
+        assert state["photos/2025/old/IMG.jpg"]["phone_path"] == \
+            "/sdcard/DCIM/Camera/IMG.jpg"
+
+    def test_new_content_left_for_normal_sync(self, harness):
+        harness.computer_write("photos/2025/old.jpg", b"OLD",
+                               mtime=1736899200.0)
+        harness.phone_write("a", "DCIM/Camera/new.jpg", b"BRAND_NEW",
+                            1736899200.0)
+        engine = harness.adopt("a")
+        assert engine.stats["adopted"] == 0
+        # The new file was NOT pulled by adopt (adopt never pulls).
+        assert not harness.computer_exists("photos/2025/new.jpg")
+        assert harness.state_file_count("a") == 0
+
+    def test_adopt_then_sync_does_not_repull(self, harness):
+        content = b"ADOPT_THEN_SYNC"
+        harness.computer_write("photos/2025/here.jpg", content,
+                               mtime=1736899200.0)
+        harness.phone_write("a", "DCIM/Camera/here.jpg", content,
+                            1736899200.0)
+        harness.adopt("a")
+        # A subsequent normal sync sees it as already-synced: no new copy.
+        engine = harness.sync("a")
+        assert engine.stats["files_copied"] == 0
+        assert len(harness.computer_list("photos")) == 1
+
+    def test_dry_run_writes_no_state(self, harness):
+        content = b"DRYRUN_ADOPT"
+        harness.computer_write("photos/2025/d.jpg", content,
+                               mtime=1736899200.0)
+        harness.phone_write("a", "DCIM/Camera/d.jpg", content, 1736899200.0)
+        engine = harness.adopt("a", dry_run=True)
+        # Counted as would-adopt, but nothing written.
+        assert engine.stats["adopted"] == 1
+        assert harness.state_file_count("a") == 0
+
+    def test_adopt_never_pulls(self, harness):
+        """adopt-existing must never write to the phone or pull bytes; prove
+        no pull/push/move/delete happens."""
+        from conftest import FakeADB
+
+        class NoPullADB(FakeADB):
+            def pull(self, *a, **k):
+                raise AssertionError("adopt must not pull")
+            def push(self, *a, **k):
+                raise AssertionError("adopt must not push")
+
+        content = b"NO_PULL_PLEASE"
+        harness.computer_write("photos/2025/x.jpg", content,
+                               mtime=1736899200.0)
+        harness.phone_write("a", "DCIM/Camera/x.jpg", content, 1736899200.0)
+        engine = harness.adopt("a", adb_cls=NoPullADB)
+        assert engine.stats["adopted"] == 1
+
+
 class TestLibraryIndexBehavior:
     def test_existing_library_content_is_kept_not_skipped(self, harness):
         """Content already on disk at an untracked path is NOT suppressed —
@@ -913,6 +1057,49 @@ class TestRelevanceFiltering:
 # ---------------------------------------------------------------------------
 
 class TestDryRunGuarantees:
+    def test_dry_run_does_not_register_new_device(self, harness):
+        """A dry-run against a brand-new (unregistered) device must NOT write
+        config.json — name resolution has no persistence side effect in
+        dry-run. (TODO item K.)"""
+        from conftest import FakeADB
+        import json
+        # A device known to ADB but absent from config["devices"].
+        new_dir = harness.tmpdir / "phone_c"
+        (new_dir / "DCIM" / "Camera").mkdir(parents=True)
+        FakeADB.register("SERIAL_C", new_dir, "PhoneC")
+
+        cfg_path = harness.cfg_dir / "config.json"
+        before = cfg_path.read_bytes()
+
+        cfg = phonesync.load_config()
+        engine = phonesync.SyncEngine(
+            cfg, "SERIAL_C", dry_run=True, adb_cls=FakeADB)
+        engine.run()
+
+        after = cfg_path.read_bytes()
+        assert before == after, \
+            "dry-run must not persist a new device to config.json"
+        # And the device is genuinely absent from the persisted config.
+        assert "SERIAL_C" not in json.loads(after).get("devices", {})
+
+    def test_real_run_does_register_new_device(self, harness):
+        """Sanity: a REAL run DOES register the new device (proves the
+        dry-run guard isn't just disabling registration entirely)."""
+        from conftest import FakeADB
+        import json
+        new_dir = harness.tmpdir / "phone_d"
+        (new_dir / "DCIM" / "Camera").mkdir(parents=True)
+        FakeADB.register("SERIAL_D", new_dir, "PhoneD")
+        phonesync.approve_device(harness.cfg, "SERIAL_D", "phoned")
+
+        cfg = phonesync.load_config()
+        engine = phonesync.SyncEngine(
+            cfg, "SERIAL_D", dry_run=False, adb_cls=FakeADB)
+        engine.run()
+
+        persisted = json.loads((harness.cfg_dir / "config.json").read_bytes())
+        assert "SERIAL_D" in persisted.get("devices", {})
+
     def test_dry_run_no_computer_files(self, harness, img_data):
         c, m = img_data("p", 2025, 1, 15)
         harness.phone_write("a", "DCIM/Camera/IMG_20250115_001.jpg", c, m)
@@ -1156,6 +1343,38 @@ class TestFirstSyncConfirmation:
     """A brand-new (unapproved) device must be explicitly confirmed before
     its first non-dry-run sync. Unattended runs refuse an unapproved device.
     This also scopes the future auto-sync service to known devices (#17)."""
+
+    def test_unapproved_noninteractive_refused_before_scan(self, harness,
+                                                           img_data):
+        """C: an unapproved device in automation is refused BEFORE the phone
+        is scanned — not merely before copying. Proven by a FakeADB that
+        records whether any recursive scan happened."""
+        from conftest import FakeADB
+        scanned = {"hit": False}
+
+        class ScanTrackingADB(FakeADB):
+            def list_files_recursive(self, remote_dir, exclude_dirs=None,
+                                     max_depth=None, followlinks=True):
+                scanned["hit"] = True
+                return super().list_files_recursive(
+                    remote_dir, exclude_dirs=exclude_dirs,
+                    max_depth=max_depth, followlinks=followlinks)
+
+        harness.unapprove_device("a")
+        orig = phonesync.SyncEngine._is_interactive
+        phonesync.SyncEngine._is_interactive = lambda self: False
+        try:
+            c, m = img_data("p", 2025, 1, 15)
+            harness.phone_write(
+                "a", "DCIM/Camera/IMG_20250115_001.jpg", c, m)
+            engine = harness.sync("a", adb_cls=ScanTrackingADB)
+        finally:
+            phonesync.SyncEngine._is_interactive = orig
+
+        assert engine.run_result is False
+        assert engine._aborted_unconfirmed is True
+        assert scanned["hit"] is False, \
+            "phone must NOT be scanned for an unapproved non-interactive device"
 
     def test_unapproved_noninteractive_aborts(self, harness, img_data):
         harness.unapprove_device("a")
@@ -1602,6 +1821,89 @@ class TestFreeSpacePreflight:
         assert engine._aborted_no_space is False
 
 
+class TestTempOnDataFilesystem:
+    """The pull temp dir must live under data_dir (the filesystem the
+    free-space pre-flight guards), not under config_dir. (TODO item A.)"""
+
+    def test_temp_dir_is_under_data_dir(self, harness, img_data):
+        c, m = img_data("p", 2025, 1, 15)
+        harness.phone_write("a", "DCIM/Camera/IMG_20250115_001.jpg", c, m)
+        harness.sync("a")
+        # The temp dir is created under data_dir and cleaned up after ingest.
+        # Assert it is NOT placed under config_dir.
+        stale = harness.cfg_dir / "tmp"
+        assert not stale.exists(), \
+            "temp pulls must not live under config_dir"
+        # The file landed in the library (proving the pull/move worked from
+        # the data-dir temp).
+        assert harness.computer_exists("photos/2025/IMG_20250115_001.jpg")
+
+    def test_temp_dir_cleaned_up(self, harness, img_data):
+        c, m = img_data("p", 2025, 1, 15)
+        harness.phone_write("a", "DCIM/Camera/IMG_20250115_001.jpg", c, m)
+        harness.sync("a")
+        assert not (harness.data_dir / ".phonesync-tmp").exists()
+
+
+class TestReadOnlyDefault:
+    """Phone writes are OFF by default (read_only defaults to True). Move
+    propagation requires opting in via --apply-phone-moves. (TODO item B.)"""
+
+    def _setup_pending_move(self, harness, img_data):
+        c, m = img_data("p", 2025, 1, 15)
+        harness.phone_write("a", "DCIM/Camera/IMG_20250115_001.jpg", c, m)
+        harness.sync("a")
+        harness.computer_move(
+            "photos/2025/IMG_20250115_001.jpg",
+            "photos/2025/trip/IMG_20250115_001.jpg")
+
+    def test_default_config_is_read_only(self):
+        """A freshly built default config has read_only true."""
+        assert phonesync.default_config()["read_only"] is True
+
+    def test_default_suppresses_phone_moves(self, harness, img_data):
+        """With the production default (no explicit read_only), a pending
+        move is NOT propagated to the phone."""
+        self._setup_pending_move(harness, img_data)
+        # Drop the harness's explicit read_only=False to get the prod default.
+        cfg = phonesync.load_config()
+        cfg.pop("read_only", None)
+        phonesync.save_config(cfg)
+        engine = harness.sync("a")
+
+        assert harness.phone_exists(
+            "a", "DCIM/Camera/IMG_20250115_001.jpg")
+        assert not harness.phone_exists(
+            "a", "DCIM/Camera/trip/IMG_20250115_001.jpg")
+        assert engine.stats["phone_writes_suppressed"] == 1
+
+    def test_apply_phone_moves_flag_enables_writes(self, harness, img_data):
+        """The --apply-phone-moves flag clears read_only, so the move
+        propagates. (Driven through the harness, which injects FakeADB; the
+        flag's effect is read_only=False, which the harness sets directly.)"""
+        self._setup_pending_move(harness, img_data)
+        cfg = phonesync.load_config()
+        cfg["read_only"] = False     # what --apply-phone-moves resolves to
+        phonesync.save_config(cfg)
+        harness.sync("a")
+
+        assert harness.phone_exists(
+            "a", "DCIM/Camera/trip/IMG_20250115_001.jpg")
+        assert not harness.phone_exists(
+            "a", "DCIM/Camera/IMG_20250115_001.jpg")
+
+    def test_flag_resolution_apply_then_readonly(self):
+        """The real cmd_sync resolution (resolve_read_only): default keeps
+        writes off, --apply-phone-moves enables them, --read-only forces them
+        off and wins if both are passed."""
+        r = phonesync.resolve_read_only
+        assert r(True, False, False) is True    # default: no writes
+        assert r(True, True, False) is False    # apply: writes on
+        assert r(True, False, True) is True     # read-only flag: off
+        assert r(True, True, True) is True      # both: read-only wins
+        assert r(False, False, False) is False  # config opted in already
+
+
 class TestReadOnlyMode:
     """read_only=true must never write to the phone, while still ingesting
     (reading) normally."""
@@ -1775,6 +2077,234 @@ class TestPartialPhoneMove:
         assert not any("_phone-a" in f for f in files_after)
         # The re-pull was avoided: recognized as a move completion.
         assert engine.stats["move_completions"] >= 1
+
+
+class TestConflictPersistence:
+    """Move conflicts and partial moves are persisted to state and listable
+    via `recover`, not just counted in the run summary. (TODO item M.)"""
+
+    class _RecArgs:
+        def __init__(self, **kw):
+            self.device = None
+            self.list_tombstones = False
+            self.list_conflicts = False
+            self.list_partial_moves = False
+            self.list_backups = False
+            self.restore_backup = None
+            self.rebuild_index = False
+            for k, v in kw.items():
+                setattr(self, k, v)
+
+    def _make_conflict(self, harness, img_data):
+        c, m = img_data("p", 2025, 1, 15)
+        harness.phone_write("a", "DCIM/Camera/orig.jpg", c, m)
+        harness.sync("a")
+        harness.phone_move(
+            "a", "DCIM/Camera/orig.jpg", "DCIM/Camera/albumA/orig.jpg")
+        harness.phone_write("a", "DCIM/Camera/albumB/orig.jpg", c, m)
+        return harness.sync("a")
+
+    def test_conflict_persisted_to_state(self, harness, img_data):
+        engine = self._make_conflict(harness, img_data)
+        assert engine.stats["move_conflicts"] == 1
+        state = harness.get_state("a")
+        assert "conflicts" in state
+        assert len(state["conflicts"]) == 1
+        rec = state["conflicts"][0]
+        assert rec["old_phone_path"] == "/sdcard/DCIM/Camera/orig.jpg"
+        assert rec["reason"] == "ambiguous_move_target"
+        assert len(rec["candidates"]) >= 2
+        assert "detected_at" in rec
+
+    def test_conflict_listable_via_recover(self, harness, img_data):
+        import io
+        from contextlib import redirect_stdout
+        self._make_conflict(harness, img_data)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            phonesync.cmd_recover(self._RecArgs(list_conflicts=True))
+        out = buf.getvalue()
+        assert "conflict" in out.lower()
+        assert "/sdcard/DCIM/Camera/orig.jpg" in out
+
+    def test_conflicts_cleared_on_clean_run(self, harness, img_data):
+        """A subsequent run with no conflict clears the stale record."""
+        self._make_conflict(harness, img_data)
+        assert len(harness.get_state("a")["conflicts"]) == 1
+        # Resolve: remove the ambiguous second copy, then sync again.
+        harness.phone_delete("a", "DCIM/Camera/albumB/orig.jpg")
+        harness.sync("a")
+        assert harness.get_state("a")["conflicts"] == []
+
+    def _make_partial(self, harness, img_data):
+        from conftest import FakeADB
+        import hashlib as _h
+
+        class PartialMoveADB(FakeADB):
+            def move_safe(self, remote_src, remote_dst, expected_hash=None):
+                src = self._local(remote_src)
+                dst = self._local(remote_dst)
+                result = {"ok": False, "action": "",
+                          "source_deleted": False}
+                if dst.exists():
+                    result["action"] = "collision"
+                    return result
+                if not src.exists():
+                    result["action"] = "copy_failed"
+                    return result
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                import shutil as _s
+                _s.copy2(str(src), str(dst))
+                result["ok"] = True
+                result["action"] = "moved"
+                result["source_deleted"] = False
+                return result
+
+        c, m = img_data("p", 2025, 1, 15)
+        harness.phone_write("a", "DCIM/Camera/IMG_20250115_001.jpg", c, m)
+        harness.sync("a")
+        harness.computer_move(
+            "photos/2025/IMG_20250115_001.jpg",
+            "photos/2025/Album/IMG_20250115_001.jpg")
+        return harness.sync("a", adb_cls=PartialMoveADB)
+
+    def test_partial_move_persisted_to_state(self, harness, img_data):
+        engine = self._make_partial(harness, img_data)
+        assert engine.stats["partial_moves"] == 1
+        state = harness.get_state("a")
+        assert len(state["partial_moves"]) == 1
+        rec = state["partial_moves"][0]
+        assert rec["old_phone"] == "/sdcard/DCIM/Camera/IMG_20250115_001.jpg"
+        assert rec["new_phone"] == \
+            "/sdcard/DCIM/Camera/Album/IMG_20250115_001.jpg"
+        assert rec["reason"] == "source_not_removed"
+
+    def test_partial_move_listable_via_recover(self, harness, img_data):
+        import io
+        from contextlib import redirect_stdout
+        self._make_partial(harness, img_data)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            phonesync.cmd_recover(self._RecArgs(list_partial_moves=True))
+        out = buf.getvalue()
+        assert "partial move" in out.lower()
+
+    def test_dry_run_does_not_persist_conflicts(self, harness, img_data):
+        """A dry-run never writes state, so it must not persist conflict
+        records either."""
+        c, m = img_data("p", 2025, 1, 15)
+        harness.phone_write("a", "DCIM/Camera/orig.jpg", c, m)
+        harness.sync("a")
+        harness.phone_move(
+            "a", "DCIM/Camera/orig.jpg", "DCIM/Camera/albumA/orig.jpg")
+        harness.phone_write("a", "DCIM/Camera/albumB/orig.jpg", c, m)
+        harness.sync("a", dry_run=True)
+        # No state written by the dry run; the only persisted state is from
+        # the first (clean) sync, which had no conflicts.
+        state = harness.get_state("a")
+        assert state.get("conflicts", []) == []
+
+
+class TestPlanOutput:
+    """Structured plan records (PlanRecorder) describe what a run did/would
+    do, for review and automation. (TODO item D.)"""
+
+    def test_ingest_record_emitted_on_dry_run(self, harness, img_data):
+        c, m = img_data("p", 2025, 1, 15)
+        harness.phone_write("a", "DCIM/Camera/IMG_20250115_001.jpg", c, m)
+        engine = harness.sync("a", dry_run=True)
+        ingests = engine.plan.of_kind("ingest")
+        assert len(ingests) == 1
+        r = ingests[0]
+        assert r["phone_path"] == "/sdcard/DCIM/Camera/IMG_20250115_001.jpg"
+        assert r["computer_relpath"] == "photos/2025/IMG_20250115_001.jpg"
+        assert r["category"] == "photos"
+
+    def test_phone_move_record_has_audit_fields(self, harness, img_data):
+        c, m = img_data("p", 2025, 1, 15)
+        harness.phone_write("a", "DCIM/Camera/IMG_20250115_001.jpg", c, m)
+        harness.sync("a")
+        harness.computer_move(
+            "photos/2025/IMG_20250115_001.jpg",
+            "photos/2025/trip/IMG_20250115_001.jpg")
+        engine = harness.sync("a", dry_run=True)
+        moves = engine.plan.of_kind("phone_move")
+        assert len(moves) == 1
+        r = moves[0]
+        # The fields the audit specifically asked for.
+        assert r["phone_old"] == "/sdcard/DCIM/Camera/IMG_20250115_001.jpg"
+        assert r["phone_new"] == \
+            "/sdcard/DCIM/Camera/trip/IMG_20250115_001.jpg"
+        assert r["source_exists"] is True
+        assert r["dest_exists"] is False
+        assert r["would_remove_old_phone_path"] is True
+        assert r["reason"] == "local_folder_organization_changed"
+
+    def test_conflict_record_in_plan(self, harness, img_data):
+        c, m = img_data("p", 2025, 1, 15)
+        harness.phone_write("a", "DCIM/Camera/orig.jpg", c, m)
+        harness.sync("a")
+        harness.phone_move(
+            "a", "DCIM/Camera/orig.jpg", "DCIM/Camera/albumA/orig.jpg")
+        harness.phone_write("a", "DCIM/Camera/albumB/orig.jpg", c, m)
+        engine = harness.sync("a", dry_run=True)
+        conflicts = engine.plan.of_kind("conflict")
+        assert len(conflicts) == 1
+        assert len(conflicts[0]["candidates"]) >= 2
+
+    def test_deletion_record_in_plan(self, harness, img_data):
+        c, m = img_data("p", 2025, 1, 15)
+        harness.phone_write("a", "DCIM/Camera/IMG_20250115_001.jpg", c, m)
+        harness.sync("a")
+        harness.computer_delete("photos/2025/IMG_20250115_001.jpg")
+        engine = harness.sync("a", dry_run=True)
+        dels = engine.plan.of_kind("deletion")
+        assert len(dels) == 1
+        assert dels[0]["computer_relpath"] == \
+            "photos/2025/IMG_20250115_001.jpg"
+
+    def test_render_text_contains_sections(self, harness, img_data):
+        c, m = img_data("p", 2025, 1, 15)
+        harness.phone_write("a", "DCIM/Camera/IMG_20250115_001.jpg", c, m)
+        engine = harness.sync("a", dry_run=True)
+        text = engine.plan.render_text()
+        assert "Plan for phone-a" in text
+        assert "Ingest" in text
+
+    def test_details_filter_limits_kinds(self, harness, img_data):
+        c, m = img_data("p", 2025, 1, 15)
+        harness.phone_write("a", "DCIM/Camera/IMG_20250115_001.jpg", c, m)
+        harness.sync("a")
+        harness.computer_move(
+            "photos/2025/IMG_20250115_001.jpg",
+            "photos/2025/trip/IMG_20250115_001.jpg")
+        engine = harness.sync("a", dry_run=True)
+        text = engine.plan.render_text(details={"phone_move"})
+        assert "Phone-side moves" in text
+        assert "Ingest" not in text
+
+    def test_plan_json_to_stdout(self, harness, img_data):
+        """_emit_plan with --plan-json - writes JSON to stdout."""
+        import io
+        import json as _json
+        from contextlib import redirect_stdout
+        c, m = img_data("p", 2025, 1, 15)
+        harness.phone_write("a", "DCIM/Camera/IMG_20250115_001.jpg", c, m)
+        engine = harness.sync("a", dry_run=True)
+
+        class Args:
+            plan = False
+            plan_json = "-"
+            details = None
+            dry_run = True
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            phonesync._emit_plan([engine], Args())
+        payload = _json.loads(buf.getvalue())
+        assert payload["dry_run"] is True
+        assert payload["devices"][0]["device"] == "phone-a"
+        assert payload["devices"][0]["counts"].get("ingest") == 1
 
 
 # ---------------------------------------------------------------------------

@@ -645,6 +645,11 @@ class TestHarness:
             "data_dir": str(self.data_dir),
             "photo_date_folders": True, "recursive_scan": True,
             "preserve_phone_subdirs": True,
+            # Production defaults read_only=True (no phone writes). The
+            # existing move-propagation tests assume writes happen, so the
+            # harness opts in, mirroring a user who passes --apply-phone-moves.
+            # The default-true behavior is covered by TestReadOnlyDefault.
+            "read_only": False,
             "delete_from_phone_after_sync": False,
             "propagate_computer_deletes_to_phone": False,
             "max_symlink_depth": 2,
@@ -788,6 +793,15 @@ class TestHarness:
             adb_cls=adb_cls or FakeADB)
         # Capture the run() boolean so tests can assert on abort behavior.
         engine.run_result = engine.run()
+        return engine
+
+    def adopt(self, phone, dry_run=False, adb_cls=None):
+        self.cfg = phonesync.load_config()
+        serial = self._phone_serial(phone)
+        engine = phonesync.SyncEngine(
+            self.cfg, serial, dry_run=dry_run,
+            adb_cls=adb_cls or FakeADB)
+        engine.run_result = engine.adopt_existing()
         return engine
 
     def sync_all(self, dry_run=False):

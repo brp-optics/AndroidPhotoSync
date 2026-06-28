@@ -25,6 +25,7 @@ Usage:
 """
 
 import argparse
+import builtins
 import fcntl
 import fnmatch
 import hashlib
@@ -343,6 +344,13 @@ class DeviceState:
         self.state_path = self.cfg_dir / f"state-{device_name}.json"
         self.files = {}
         self.last_sync = None
+        # Unresolved issues from the most recent run, persisted so `recover`
+        # can list them after the run ends (they're otherwise only summary
+        # counters). Cleared at the start of move detection each run.
+        self.conflicts = []        # [{relpath?, old_phone_path, candidates,
+                                   #   reason, detected_at}]
+        self.partial_moves = []    # [{relpath, old_phone, new_phone, reason,
+                                   #   detected_at}]
         self._load()
 
     def _load(self):
@@ -351,6 +359,36 @@ class DeviceState:
                 data = json.load(f)
             self.files = data.get("files", {})
             self.last_sync = data.get("last_sync")
+            self.conflicts = data.get("conflicts", [])
+            self.partial_moves = data.get("partial_moves", [])
+
+    def clear_run_issues(self):
+        """Reset conflict/partial-move records at the start of a run so they
+        reflect only the latest run, not accumulate across runs."""
+        self.conflicts = []
+        self.partial_moves = []
+
+    def record_conflict(self, old_phone_path: str, candidates: list,
+                        reason: str = "ambiguous_move_target",
+                        relpath: str = ""):
+        self.conflicts.append({
+            "relpath": relpath,
+            "old_phone_path": old_phone_path,
+            "candidates": list(candidates),
+            "reason": reason,
+            "detected_at": datetime.now().isoformat(),
+        })
+
+    def record_partial_move(self, relpath: str, old_phone: str,
+                            new_phone: str,
+                            reason: str = "source_not_removed"):
+        self.partial_moves.append({
+            "relpath": relpath,
+            "old_phone": old_phone,
+            "new_phone": new_phone,
+            "reason": reason,
+            "detected_at": datetime.now().isoformat(),
+        })
 
     def save(self):
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -366,6 +404,8 @@ class DeviceState:
             "device_name": self.device_name,
             "last_sync": datetime.now().isoformat(),
             "files": self.files,
+            "conflicts": self.conflicts,
+            "partial_moves": self.partial_moves,
         }
         _atomic_json_write(self.state_path, data)
 
@@ -1061,6 +1101,96 @@ class LibraryIndex:
 # Core Sync Engine
 # ---------------------------------------------------------------------------
 
+class PlanRecorder:
+    """Collects structured plan records describing what a run did or (in
+    dry-run) would do, so the log isn't the only review surface for
+    automation. Records are appended by the phases and can be rendered as a
+    human-readable plan or emitted as JSON (TODO item D).
+
+    Record kinds: "ingest", "phone_move", "deletion", "conflict",
+    "partial_move". Each carries a "kind" plus kind-specific fields.
+    """
+
+    def __init__(self, device_name: str, dry_run: bool):
+        self.device_name = device_name
+        self.dry_run = dry_run
+        self.records = []
+
+    def add(self, kind: str, **fields):
+        rec = {"kind": kind}
+        rec.update(fields)
+        self.records.append(rec)
+
+    def of_kind(self, kind: str):
+        return [r for r in self.records if r["kind"] == kind]
+
+    def to_dict(self):
+        counts = {}
+        for r in self.records:
+            counts[r["kind"]] = counts.get(r["kind"], 0) + 1
+        return {
+            "device": self.device_name,
+            "dry_run": self.dry_run,
+            "counts": counts,
+            "records": self.records,
+        }
+
+    def render_text(self, details=None):
+        """Human-readable plan. `details` optionally filters to certain kinds
+        (e.g. {"phone_move"}) for `--details moves`."""
+        lines = []
+        prefix = "[DRY RUN] " if self.dry_run else ""
+        lines.append(f"{prefix}Plan for {self.device_name}:")
+        order = ["ingest", "phone_move", "partial_move", "deletion",
+                 "conflict"]
+        labels = {
+            "ingest": "Ingest (phone -> computer)",
+            "phone_move": "Phone-side moves",
+            "partial_move": "Partial moves (file left at both paths)",
+            "deletion": "Tombstones (deleted on computer)",
+            "conflict": "Move conflicts (not guessed)",
+        }
+        for kind in order:
+            if details and kind not in details:
+                continue
+            recs = self.of_kind(kind)
+            if not recs:
+                continue
+            lines.append(f"\n  {labels[kind]}: {len(recs)}")
+            for r in recs:
+                lines.append("    " + self._render_record(kind, r))
+        if len(lines) == 1:
+            lines.append("  (nothing to do)")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _render_record(kind, r):
+        if kind == "ingest":
+            return f"{r.get('phone_path')} -> {r.get('computer_relpath')}"
+        if kind == "phone_move":
+            flags = []
+            if not r.get("source_exists", True):
+                flags.append("source MISSING")
+            if r.get("dest_exists"):
+                flags.append("dest EXISTS")
+            if r.get("would_remove_old_phone_path"):
+                flags.append("would remove old path")
+            suffix = f"  [{', '.join(flags)}]" if flags else ""
+            return (f"{r.get('phone_old')} -> {r.get('phone_new')} "
+                    f"({r.get('reason', '')}){suffix}")
+        if kind == "partial_move":
+            return (f"{r.get('phone_old')} -> {r.get('phone_new')} "
+                    f"(relpath: {r.get('computer_relpath')})")
+        if kind == "deletion":
+            return f"{r.get('computer_relpath')} ({r.get('category', '')})"
+        if kind == "conflict":
+            cands = ", ".join(c.get("path", "?")
+                              for c in r.get("candidates", []))
+            return (f"{r.get('phone_old')} ({r.get('reason', '')}); "
+                    f"candidates: {cands}")
+        return str(r)
+
+
 class SyncEngine:
     def __init__(self, cfg: dict, device_serial: str, dry_run: bool = False,
                  adb_cls=None):
@@ -1073,6 +1203,7 @@ class SyncEngine:
         self.device_name = self._resolve_device_name()
         self.adb = self.adb_cls(device_serial)
         self.state = DeviceState(device_serial, self.device_name, cfg)
+        self.plan = PlanRecorder(self.device_name, dry_run)
 
         self.stats = {
             "files_copied": 0,
@@ -1089,6 +1220,7 @@ class SyncEngine:
             "phone_writes_suppressed": 0,  # phone moves skipped in read-only mode
             "overwrites_applied": 0,   # local file overwritten by phone edit
             "overwrites_kept_local": 0,  # phone edit declined, local file kept
+            "adopted": 0,            # adopt-existing: mapped to on-disk copy
             "bytes_copied": 0,
         }
         self.discovered_subdirs = []
@@ -1104,6 +1236,12 @@ class SyncEngine:
         self._phone_moved_relpaths = set()
 
     def _resolve_device_name(self) -> str:
+        """Return this device's name. For an already-known device that's just
+        a lookup. For a NEW device, compute a unique name; persist the device
+        into config ONLY when not a dry run — a dry run must change nothing
+        on disk (TODO item K). Name resolution itself has no write side
+        effect; registration is an explicit, guarded step.
+        """
         devices_cfg = self.cfg.get("devices", {})
         if self.device_serial in devices_cfg:
             return devices_cfg[self.device_serial]["name"]
@@ -1120,6 +1258,19 @@ class SyncEngine:
             counter += 1
             name = f"{base_name}-{counter}"
 
+        if self.dry_run:
+            # Don't touch config.json on a dry run. Report what WOULD happen.
+            logging.info(
+                f"[DRY RUN] Would register new device: {name} ({model}) "
+                f"[{self.device_serial}]")
+            return name
+
+        self._register_device(name, model)
+        return name
+
+    def _register_device(self, name: str, model: str):
+        """Persist a new device into config.json. Real-run only."""
+        devices_cfg = self.cfg.get("devices", {})
         devices_cfg[self.device_serial] = {
             "name": name,
             "model": model,
@@ -1127,9 +1278,9 @@ class SyncEngine:
         }
         self.cfg["devices"] = devices_cfg
         save_config(self.cfg)
-
-        logging.info(f"Registered new device: {name} ({model}) [{self.device_serial}]")
-        return name
+        logging.info(
+            f"Registered new device: {name} ({model}) "
+            f"[{self.device_serial}]")
 
 
     ## TODO study this
@@ -1235,6 +1386,23 @@ class SyncEngine:
                      f"{self.device_name} ({self.device_serial})")
 
         # Scan the phone ONCE — all phases share this snapshot. If the scan
+        # C: For automation, reject an unapproved first-time device BEFORE
+        # scanning it. Scanning enumerates the whole phone (privacy /
+        # performance), and an unattended run must not even do that for a
+        # device it will refuse anyway. The interactive prompt path stays
+        # AFTER the scan (below), because the confirmation shows a pull
+        # estimate that needs the scan. Dry-run skips the gate entirely.
+        if (not self.dry_run and self._is_first_time_device()
+                and not self._is_interactive()):
+            self._aborted_unconfirmed = True
+            logging.error(
+                f"Device '{self.device_name}' ({self.device_serial}) is not "
+                f"approved for syncing, and there is no terminal to confirm.")
+            logging.error(
+                f"  Refusing before scan. Approve it first with:  "
+                f"phonesync devices --approve {self.device_serial}")
+            return False
+
         # fails (device unreachable, transport error), abort the ENTIRE run
         # before any phase mutates state. Acting on a partial/empty snapshot
         # could mis-tombstone or mis-move files we simply couldn't see.
@@ -1268,6 +1436,13 @@ class SyncEngine:
             self.library.build()
             logging.info(
                 f"    Indexed {len(self.library._cache)} library files")
+
+        # Reset last run's conflict/partial-move records BEFORE detection so
+        # what we persist reflects only THIS run. Must precede phase 1, which
+        # is where conflicts are recorded. (Real runs only — dry-run never
+        # saves, so leaving prior records in memory is harmless there.)
+        if not self.dry_run:
+            self.state.clear_run_issues()
 
         # Phase 1: Detect phone-side moves (must happen before ingest
         # so moved files aren't re-ingested as new)
@@ -1458,6 +1633,88 @@ class SyncEngine:
             f"  Skipping. Approve it first with:  "
             f"phonesync devices --approve {self.device_serial}")
         return False
+
+    def adopt_existing(self) -> bool:
+        """Adopt a pre-existing on-disk library: for each phone file whose
+        CONTENT already exists somewhere in the data dir, record a state
+        mapping to that existing relpath WITHOUT pulling a second copy.
+        Files not already present are left untouched for a normal sync.
+
+        Opt-in (the `adopt-existing` command), because it changes the meaning
+        of duplicates (#16 keeps every copy; this deliberately does not pull a
+        copy that's already on disk). Honors dry_run. Returns False on a scan
+        failure (so the CLI can exit non-zero), True otherwise.
+        """
+        logging.info(f"=== Adopt-existing for {self.device_name} ===")
+        try:
+            self.phone_scan = self._scan_phone()
+        except ADBError as e:
+            self.stats["errors"] += 1
+            logging.error(
+                f"ABORTING adopt for {self.device_name}: phone scan failed.")
+            logging.error(f"  {e}")
+            self._scan_failed = True
+            return False
+
+        # Approval gate applies here too (this writes state for a device).
+        if not self.dry_run and not self._check_first_time_device():
+            self._aborted_unconfirmed = True
+            return False
+
+        logging.info("=== Indexing library ===")
+        self.library.build()
+        logging.info(f"    Indexed {len(self.library._cache)} library files")
+
+        adopted = 0
+        already_tracked = 0
+        not_present = 0
+
+        for category, dir_scans in self.phone_scan.items():
+            for phone_dir, files in dir_scans:
+                for finfo in files:
+                    filename = finfo["name"]
+                    phone_path = finfo["path"]
+                    size = finfo["size"]
+                    if not self._is_relevant_file(filename, category):
+                        continue
+                    # Already tracked for this device? nothing to do.
+                    if self.state.find_by_phone_path(phone_path):
+                        already_tracked += 1
+                        continue
+                    # Cheap size pre-filter before asking the phone to hash.
+                    if not self.library.maybe_prerun_size(size):
+                        not_present += 1
+                        continue
+                    phone_hash = self.adb.file_hash(phone_path)
+                    if not phone_hash or not \
+                            self.library.contains_hash_prerun(phone_hash):
+                        not_present += 1
+                        continue
+                    relpath = self.library.paths_for_hash(phone_hash)[0]
+                    if self.dry_run:
+                        logging.info(
+                            f"  [DRY RUN] Would adopt: {phone_path} -> "
+                            f"{relpath}")
+                        adopted += 1
+                        continue
+                    mtime_iso = datetime.fromtimestamp(
+                        finfo["mtime_epoch"]).isoformat()
+                    self.state.add_file(
+                        relpath, phone_path, phone_hash, size, mtime_iso,
+                        category, phone_source_dir=phone_dir)
+                    logging.info(f"  Adopted: {phone_path} -> {relpath}")
+                    adopted += 1
+
+        self.stats["adopted"] = adopted
+        if not self.dry_run and adopted:
+            self.state.save()
+
+        prefix = "[DRY RUN] " if self.dry_run else ""
+        logging.info(
+            f"{prefix}Adopt complete for {self.device_name}: "
+            f"{adopted} adopted, {already_tracked} already tracked, "
+            f"{not_present} not in library (left for normal sync).")
+        return True
 
     def _is_interactive(self) -> bool:
         """True if we can prompt the user. False under cron/udev/automation
@@ -1663,7 +1920,7 @@ class SyncEngine:
                     })
 
             new_phone_path = self._choose_move_target(
-                old_phone_path, candidates)
+                old_phone_path, candidates, relpath=relpath)
 
             if new_phone_path:
                 logging.info(
@@ -1687,7 +1944,8 @@ class SyncEngine:
             # computer (safe delete behavior)
 
     def _choose_move_target(self, old_phone_path: str,
-                            candidates: list[dict]) -> Optional[str]:
+                            candidates: list[dict],
+                            relpath: str = "") -> Optional[str]:
         """Pick the single best move target from same-content candidates.
 
         candidates: [{"path", "name_match", "mtime_match"}, ...]
@@ -1735,6 +1993,14 @@ class SyncEngine:
                 f"(name_match={c['name_match']}, "
                 f"mtime_match={c['mtime_match']})")
         self.stats["move_conflicts"] += 1
+        cand_list = [{"path": c["path"], "name_match": c["name_match"],
+                      "mtime_match": c["mtime_match"]} for c in best]
+        self.state.record_conflict(
+            old_phone_path, cand_list,
+            reason="ambiguous_move_target", relpath=relpath)
+        self.plan.add(
+            "conflict", computer_relpath=relpath, phone_old=old_phone_path,
+            reason="ambiguous_move_target", candidates=cand_list)
         return None
 
     def _phase_ingest(self):
@@ -1835,6 +2101,13 @@ class SyncEngine:
                     f"  [DRY RUN] Would {action}: {phone_path}")
                 logging.info(
                     f"              -> {dest_display}")
+                self.plan.add(
+                    "ingest",
+                    phone_path=phone_path,
+                    computer_relpath=dest_display,
+                    category=category,
+                    action=action,
+                    size=finfo.get("size", 0))
                 self.stats["files_copied"] += 1
                 continue
 
@@ -2128,6 +2401,9 @@ class SyncEngine:
                     (relpath, info.get("category", "unknown")))
                 self.stats["local_deletions"] += 1
                 self.state.files[relpath]["deleted_from_computer"] = True
+                self.plan.add(
+                    "deletion", computer_relpath=relpath,
+                    category=info.get("category", "unknown"))
 
         # Also recompute desired phone paths for files that haven't moved
         # on the computer but whose phone path might be stale (e.g. from
@@ -2164,6 +2440,21 @@ class SyncEngine:
                 logging.info(
                     f"  {tag} Would move on phone: "
                     f"{old_phone} -> {new_phone}")
+                # Structured plan record: query the phone (read-only) so the
+                # plan shows whether the move would actually be safe.
+                src_exists = self.adb.file_exists(old_phone)
+                dst_exists = self.adb.file_exists(new_phone)
+                self.plan.add(
+                    "phone_move",
+                    computer_relpath=relpath,
+                    phone_old=old_phone,
+                    phone_new=new_phone,
+                    reason="local_folder_organization_changed",
+                    source_exists=src_exists,
+                    dest_exists=dst_exists,
+                    would_remove_old_phone_path=(src_exists and not
+                                                 dst_exists),
+                    suppressed_read_only=(read_only and not self.dry_run))
                 if read_only and not self.dry_run:
                     self.stats["phone_writes_suppressed"] += 1
                 continue
@@ -2199,6 +2490,13 @@ class SyncEngine:
                     f"{new_phone}).")
                 self.stats["errors"] += 1
                 self.stats["partial_moves"] += 1
+                self.state.record_partial_move(
+                    relpath, old_phone, new_phone,
+                    reason="source_not_removed")
+                self.plan.add(
+                    "partial_move", computer_relpath=relpath,
+                    phone_old=old_phone, phone_new=new_phone,
+                    reason="source_not_removed")
             else:
                 self.stats["errors"] += 1
 
@@ -2346,6 +2644,15 @@ class SyncEngine:
         return _scan_recursive(self.data_dir)
 
     def _print_summary(self):
+        # The summary is human-facing diagnostic output, so it goes to
+        # stderr alongside progress (stdout is reserved for any future
+        # machine-readable output). Shadow print() locally to avoid changing
+        # every line below.
+        def print(*a, **k):
+            k.setdefault("file", sys.stderr)
+            k.setdefault("flush", True)
+            builtins.print(*a, **k)
+
         s = self.stats
         prefix = "[DRY RUN] " if self.dry_run else ""
         print(f"\n{prefix}Sync complete for {self.device_name}:")
@@ -2466,6 +2773,38 @@ def resolve_read_only(config_read_only: bool, apply_phone_moves: bool,
     return effective
 
 
+def cmd_adopt_existing(args):
+    cfg = load_config()
+    lock = SyncLock(Path(cfg["config_dir"]))
+    if not lock.acquire():
+        print("Another phonesync instance is already running. Exiting.")
+        sys.exit(1)
+    try:
+        if args.device:
+            serials = [args.device]
+        else:
+            devices = list_connected_devices()
+            if not devices:
+                print("No ADB devices connected.")
+                print("Connect a phone with USB debugging enabled.")
+                sys.exit(1)
+            serials = [d["serial"] for d in devices]
+            print(f"Found {len(devices)} device(s): "
+                  f"{', '.join(d['model'] for d in devices)}")
+
+        any_failed = False
+        for serial in serials:
+            engine = SyncEngine(cfg, serial, dry_run=args.dry_run)
+            ok = engine.adopt_existing()
+            if ok is False:
+                any_failed = True
+    finally:
+        lock.release()
+
+    if any_failed:
+        sys.exit(2)
+
+
 def cmd_sync(args):
     cfg = load_config()
     # Phone writes (move propagation) are OFF by default. --apply-phone-moves
@@ -2498,19 +2837,63 @@ def cmd_sync(args):
                   f"{', '.join(d['model'] for d in devices)}")
 
         any_failed = False
+        engines = []
         for serial in serials:
             engine = SyncEngine(cfg, serial, dry_run=args.dry_run)
             ok = engine.run()
             if ok is False:
                 any_failed = True
+            engines.append(engine)
             print()
     finally:
         lock.release()
 
+    _emit_plan(engines, args)
+
     if any_failed:
-        # A device scan failed mid-run; surface a non-zero exit so callers
-        # (cron, udev-triggered syncs) can detect the partial failure.
         sys.exit(2)
+
+
+def _emit_plan(engines, args):
+    """Render the structured plan (--plan / --plan-json / --details) from the
+    engines' PlanRecorders. Human plan -> stderr (diagnostic); JSON -> the
+    requested file, or stdout for '-' (machine-readable output belongs on
+    stdout)."""
+    want_text = getattr(args, "plan", False)
+    json_target = getattr(args, "plan_json", None)
+    if not want_text and not json_target:
+        return
+
+    details = None
+    d = getattr(args, "details", None)
+    if d and d != "all":
+        details = {
+            "moves": "phone_move", "ingest": "ingest",
+            "deletions": "deletion", "conflicts": "conflict",
+        }.get(d)
+        details = {details} if details else None
+
+    if want_text:
+        for engine in engines:
+            print(engine.plan.render_text(details=details), file=sys.stderr,
+                  flush=True)
+
+    if json_target:
+        payload = {
+            "dry_run": bool(getattr(args, "dry_run", False)),
+            "devices": [engine.plan.to_dict() for engine in engines],
+        }
+        text = json.dumps(payload, indent=2)
+        if json_target == "-":
+            builtins.print(text, flush=True)   # machine output -> stdout
+        else:
+            try:
+                with open(json_target, "w") as f:
+                    f.write(text)
+                print(f"Wrote plan JSON to {json_target}", file=sys.stderr)
+            except OSError as e:
+                print(f"Could not write plan JSON to {json_target}: {e}",
+                      file=sys.stderr)
 
 
 def cmd_status(args):
@@ -2824,6 +3207,190 @@ def cmd_prune_state(args):
         print(f"  Final entries:      {len(state.files)}")
 
 
+def _state_paths_for(cfg, target_device):
+    """Yield (name, state_path) for the target device or all devices."""
+    cfg_dir = Path(cfg["config_dir"])
+    devices = cfg.get("devices", {})
+    for serial, info in devices.items():
+        name = info.get("name", serial)
+        if target_device and target_device not in (serial, name):
+            continue
+        yield name, cfg_dir / f"state-{name}.json"
+
+
+def cmd_recover(args):
+    """Recovery / introspection for unattended operation.
+
+    Read-only by default (listing). --restore-backup and --rebuild-index are
+    the only state-changing actions, and each requires an explicit flag.
+    """
+    cfg = load_config()
+    cfg_dir = Path(cfg["config_dir"])
+
+    did_something = False
+
+    # --- list tombstones ----------------------------------------------------
+    if args.list_tombstones:
+        did_something = True
+        any_found = False
+        for name, sp in _state_paths_for(cfg, args.device):
+            if not sp.exists():
+                continue
+            try:
+                with open(sp) as f:
+                    files = json.load(f).get("files", {})
+            except (OSError, json.JSONDecodeError):
+                print(f"  {name}: could not read state file")
+                continue
+            tombstoned = [rp for rp, i in files.items()
+                          if i.get("deleted_from_computer")]
+            if tombstoned:
+                any_found = True
+                print(f"\n{name}: {len(tombstoned)} tombstoned "
+                      f"(deleted on computer, won't re-download):")
+                for rp in sorted(tombstoned):
+                    print(f"  {rp}")
+        if not any_found:
+            print("No tombstoned files.")
+        print("\nTo clear tombstones (allow re-download): "
+              "phonesync prune-state --clear-tombstones")
+
+    # --- list backups -------------------------------------------------------
+    if args.list_backups:
+        did_something = True
+        backup_dir = cfg_dir / "state-backups"
+        backups = sorted(backup_dir.glob("state-*.json")) \
+            if backup_dir.exists() else []
+        if args.device:
+            backups = [b for b in backups
+                       if b.name.startswith(f"state-{args.device}.")
+                       or f"-{args.device}." in b.name]
+        if not backups:
+            print("No state backups found.")
+        else:
+            print(f"State backups in {backup_dir}:")
+            for b in backups:
+                print(f"  {b.name}")
+            print("\nRestore with: phonesync recover --restore-backup "
+                  "<filename>")
+
+    # --- restore a backup ---------------------------------------------------
+    if args.restore_backup:
+        did_something = True
+        backup_dir = cfg_dir / "state-backups"
+        src = backup_dir / args.restore_backup
+        if not src.exists():
+            # Allow passing just a timestamp/partial — match uniquely.
+            matches = sorted(backup_dir.glob(f"*{args.restore_backup}*")) \
+                if backup_dir.exists() else []
+            if len(matches) == 1:
+                src = matches[0]
+            elif len(matches) > 1:
+                print(f"Ambiguous: {args.restore_backup} matches "
+                      f"{len(matches)} backups. Be more specific:")
+                for m in matches:
+                    print(f"  {m.name}")
+                sys.exit(1)
+            else:
+                print(f"Backup not found: {args.restore_backup}")
+                print("List available backups: phonesync recover "
+                      "--list-backups")
+                sys.exit(1)
+        # The backup file is state-<name>.<stamp>.json -> restore to
+        # state-<name>.json. Strip the trailing .<stamp>.json (two suffixes).
+        stem = src.name
+        # remove ".json"
+        stem = stem[:-len(".json")] if stem.endswith(".json") else stem
+        # remove ".<stamp>"
+        base = stem.rsplit(".", 1)[0]
+        dest = cfg_dir / f"{base}.json"
+        # Back up the current state before overwriting it, so restore is
+        # itself reversible.
+        if dest.exists():
+            safety = cfg_dir / "state-backups" / \
+                f"{base}.pre-restore-" \
+                f"{datetime.now().strftime('%Y%m%d-%H%M%S-%f')}.json"
+            safety.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(str(dest), str(safety))
+            print(f"Saved current state to {safety.name} before restoring.")
+        shutil.copy2(str(src), str(dest))
+        print(f"Restored {dest.name} from {src.name}")
+
+    # --- list conflicts -----------------------------------------------------
+    if getattr(args, "list_conflicts", False):
+        did_something = True
+        any_found = False
+        for name, sp in _state_paths_for(cfg, args.device):
+            if not sp.exists():
+                continue
+            try:
+                with open(sp) as f:
+                    conflicts = json.load(f).get("conflicts", [])
+            except (OSError, json.JSONDecodeError):
+                continue
+            if conflicts:
+                any_found = True
+                print(f"\n{name}: {len(conflicts)} unresolved move "
+                      f"conflict(s) from the last run:")
+                for c in conflicts:
+                    print(f"  {c.get('old_phone_path', '?')} "
+                          f"({c.get('reason', '')})")
+                    for cand in c.get("candidates", []):
+                        print(f"      candidate: {cand.get('path', '?')} "
+                              f"(name_match={cand.get('name_match')}, "
+                              f"mtime_match={cand.get('mtime_match')})")
+        if not any_found:
+            print("No unresolved move conflicts.")
+
+    # --- list partial moves -------------------------------------------------
+    if getattr(args, "list_partial_moves", False):
+        did_something = True
+        any_found = False
+        for name, sp in _state_paths_for(cfg, args.device):
+            if not sp.exists():
+                continue
+            try:
+                with open(sp) as f:
+                    partials = json.load(f).get("partial_moves", [])
+            except (OSError, json.JSONDecodeError):
+                continue
+            if partials:
+                any_found = True
+                print(f"\n{name}: {len(partials)} partial move(s) from the "
+                      f"last run (file exists at BOTH paths on the phone):")
+                for p in partials:
+                    print(f"  {p.get('old_phone', '?')} -> "
+                          f"{p.get('new_phone', '?')}  "
+                          f"(relpath: {p.get('relpath', '?')})")
+        if not any_found:
+            print("No partial moves.")
+
+    # --- rebuild library index ---------------------------------------------
+    if args.rebuild_index:
+        did_something = True
+        cache = cfg_dir / "library-index.json"
+        if cache.exists():
+            try:
+                cache.unlink()
+            except OSError as e:
+                print(f"Could not remove old index: {e}")
+        idx = LibraryIndex(get_data_dir(cfg), cfg)
+        idx.build()
+        print(f"Rebuilt library index: {len(idx._cache)} files indexed "
+              f"({cache}).")
+
+    if not did_something:
+        print("Nothing to do. Available actions:")
+        print("  --list-tombstones      files deleted on computer "
+              "(won't re-download)")
+        print("  --list-conflicts       unresolved move conflicts (last run)")
+        print("  --list-partial-moves   files left at both phone paths "
+              "(last run)")
+        print("  --list-backups         available state backups")
+        print("  --restore-backup NAME  restore a state backup")
+        print("  --rebuild-index        rebuild the library content index")
+
+
 def cmd_reset_state(args):
     cfg = load_config()
     cfg_dir = Path(cfg["config_dir"])
@@ -2849,6 +3416,45 @@ def cmd_reset_state(args):
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+
+class _FlushingStreamHandler(logging.StreamHandler):
+    """StreamHandler that flushes after every record, so progress shows up
+    live even when stderr is block-buffered (piped/redirected)."""
+    def emit(self, record):
+        super().emit(record)
+        try:
+            self.flush()
+        except Exception:
+            pass
+
+
+def setup_output(verbose: bool = False):
+    """Configure live, line-buffered output following Unix conventions:
+    diagnostics and progress go to STDERR (so stdout stays clean for any
+    machine-readable output), and both streams are line-buffered so a long
+    sync streams progress instead of dumping everything at exit.
+
+    Without this, when stdout/stderr are piped or redirected, Python
+    block-buffers them and nothing appears until the process ends — which
+    makes the tool useless for watching progress (TODO item L).
+    """
+    # Force line buffering so each print()/log line is flushed immediately,
+    # even when not attached to a TTY. reconfigure() exists on the standard
+    # text streams in Python 3.7+; guard in case stdout/stderr were replaced.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(line_buffering=True)
+        except (AttributeError, ValueError):
+            pass
+
+    level = logging.DEBUG if verbose else logging.INFO
+    handler = _FlushingStreamHandler(stream=sys.stderr)
+    handler.setFormatter(logging.Formatter(LOG_FORMAT))
+    root = logging.getLogger()
+    root.handlers.clear()        # replace any prior basicConfig handler
+    root.addHandler(handler)
+    root.setLevel(level)
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -2883,9 +3489,32 @@ def main():
         help="When a file was edited on BOTH phone and computer: ask "
              "(default; keeps local if non-interactive), never (always keep "
              "local edits), or always (always take the phone version)")
+    p_sync.add_argument(
+        "--plan", action="store_true",
+        help="Print a structured, reviewable plan of what the run did/would "
+             "do (most useful with --dry-run)")
+    p_sync.add_argument(
+        "--plan-json", metavar="FILE",
+        help="Write the structured plan as JSON to FILE (use '-' for stdout)")
+    p_sync.add_argument(
+        "--details", choices=["moves", "ingest", "deletions", "conflicts",
+                              "all"],
+        help="With --plan, show only records of this kind (default: all)")
 
     # status
     subparsers.add_parser("status", help="Show sync status")
+
+    # adopt-existing
+    p_adopt = subparsers.add_parser(
+        "adopt-existing",
+        help="Map phone files whose content is ALREADY in the library to the "
+             "existing copy, without pulling duplicates (for a pre-existing "
+             "main library)")
+    p_adopt.add_argument(
+        "-d", "--device", help="ADB device serial (default: all connected)")
+    p_adopt.add_argument(
+        "-n", "--dry-run", action="store_true",
+        help="Show what would be adopted without writing state")
 
     # devices
     p_devices = subparsers.add_parser(
@@ -2940,13 +3569,41 @@ def main():
         "--rehash", action="store_true",
         help="Recompute file hashes (slow but thorough)")
 
+    # recover
+    p_recover = subparsers.add_parser(
+        "recover",
+        help="Recovery/introspection: list tombstones/backups, restore a "
+             "state backup, rebuild the library index")
+    p_recover.add_argument(
+        "-d", "--device", help="Device serial or name (default: all)")
+    p_recover.add_argument(
+        "--list-tombstones", action="store_true",
+        help="List files deleted on the computer (won't be re-downloaded)")
+    p_recover.add_argument(
+        "--list-conflicts", action="store_true",
+        help="List unresolved move conflicts from the last run")
+    p_recover.add_argument(
+        "--list-partial-moves", action="store_true",
+        help="List partial moves from the last run (file at both phone paths)")
+    p_recover.add_argument(
+        "--list-backups", action="store_true",
+        help="List available state backups")
+    p_recover.add_argument(
+        "--restore-backup", metavar="NAME",
+        help="Restore a state backup (full filename, or a unique timestamp "
+             "substring); the current state is backed up first")
+    p_recover.add_argument(
+        "--rebuild-index", action="store_true",
+        help="Rebuild the library content index from scratch")
+
     args = parser.parse_args()
 
-    level = logging.DEBUG if args.verbose else logging.INFO
-    logging.basicConfig(format=LOG_FORMAT, level=level)
+    setup_output(verbose=args.verbose)
 
     if args.command == "sync":
         cmd_sync(args)
+    elif args.command == "adopt-existing":
+        cmd_adopt_existing(args)
     elif args.command == "status":
         cmd_status(args)
     elif args.command == "devices":
@@ -2957,6 +3614,8 @@ def main():
         cmd_config(args)
     elif args.command == "prune-state":
         cmd_prune_state(args)
+    elif args.command == "recover":
+        cmd_recover(args)
     elif args.command == "reset-state":
         cmd_reset_state(args)
     else:
