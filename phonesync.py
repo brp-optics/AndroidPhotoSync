@@ -122,7 +122,9 @@ def default_config(config_dir: str = None, data_dir: str = None):
         "preserve_phone_subdirs": True,  # Maintain subdirectory structure from phone
         "verify_pulls": True,     # Hash-verify each pull against the phone
         "use_library_index": True,  # Cache library hashes; complete partial moves
-        "read_only": False,       # Never write to the phone (skip move propagation)
+        "read_only": True,        # Safe default: no phone writes. Move
+                                  # propagation requires --apply-phone-moves
+                                  # (alias --allow-phone-writes).
         "check_free_space": True,  # Abort before pulling if the disk would fill
         "free_space_margin_bytes": 104857600,  # 100 MB headroom over estimate
         # What to do when a phone edit would overwrite a computer file that
@@ -1787,8 +1789,12 @@ class SyncEngine:
                     self.stats["files_skipped"] += 1
                     continue
 
-            # Pull to temp location
-            tmp_dir = Path(self.cfg["config_dir"]) / "tmp"
+            # Pull to a temp location ON THE DATA FILESYSTEM. The free-space
+            # pre-flight checks data_dir; if temp lived under config_dir (a
+            # possibly-small home/root FS) a big pull could fill the wrong
+            # filesystem after the check passed. Keeping temp under data_dir
+            # also makes the final move into place a same-FS rename.
+            tmp_dir = self.data_dir / ".phonesync-tmp"
             tmp_dir.mkdir(parents=True, exist_ok=True)
             tmp_path = tmp_dir / filename
 
@@ -2046,7 +2052,7 @@ class SyncEngine:
             self.stats["bytes_copied"] += size
 
         # Cleanup tmp
-        tmp_dir = Path(self.cfg["config_dir"]) / "tmp"
+        tmp_dir = self.data_dir / ".phonesync-tmp"
         if tmp_dir.exists():
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -2447,11 +2453,28 @@ def _human_size(size_bytes: int) -> str:
 # CLI Commands
 # ---------------------------------------------------------------------------
 
+def resolve_read_only(config_read_only: bool, apply_phone_moves: bool,
+                      read_only_flag: bool) -> bool:
+    """Resolve the effective read_only for a run from the config value and
+    the two CLI flags. --apply-phone-moves enables writes; --read-only forces
+    them off and wins if both are passed (the safe direction)."""
+    effective = config_read_only
+    if apply_phone_moves:
+        effective = False
+    if read_only_flag:
+        effective = True
+    return effective
+
+
 def cmd_sync(args):
     cfg = load_config()
-    # A --read-only flag forces read_only on for this run, overriding config.
-    if getattr(args, "read_only", False):
-        cfg["read_only"] = True
+    # Phone writes (move propagation) are OFF by default. --apply-phone-moves
+    # (alias --allow-phone-writes) enables them for this run; --read-only
+    # forces them off and takes precedence if both are somehow passed.
+    cfg["read_only"] = resolve_read_only(
+        cfg.get("read_only", True),
+        getattr(args, "apply_phone_moves", False),
+        getattr(args, "read_only", False))
     # --overwrite-policy overrides the config policy for this run.
     if getattr(args, "overwrite_policy", None):
         cfg["overwrite_policy"] = args.overwrite_policy
@@ -2847,7 +2870,14 @@ def main():
         help="Show what would be done")
     p_sync.add_argument(
         "--read-only", action="store_true",
-        help="Never write to the phone (skip move propagation)")
+        help="Never write to the phone (the default). Skips move "
+             "propagation.")
+    p_sync.add_argument(
+        "--apply-phone-moves", "--allow-phone-writes",
+        dest="apply_phone_moves", action="store_true",
+        help="Enable phone writes for this run: propagate computer-side "
+             "moves back to the phone (copy-verify-delete of the old path). "
+             "Off by default.")
     p_sync.add_argument(
         "--overwrite-policy", choices=["ask", "never", "always"],
         help="When a file was edited on BOTH phone and computer: ask "

@@ -2,13 +2,15 @@
 
 A single-file CLI tool that syncs photos, downloads, and recordings from one or two Android phones to a Linux computer over ADB (USB debugging). Two phones merge into one photo library, and when you sort photos into subfolders on the computer those moves are mirrored back to the phone. Deletions are never propagated in either direction, and a file you delete on the computer is not re-downloaded.
 
-This is a **one-way ingest** tool: file contents only ever flow **phone → computer**. The tool never deletes anything from a phone, and never deletes from the computer in response to a phone-side change.
+This is a **one-way ingest** tool: file contents only ever flow **phone → computer**. Content is never deleted from a phone *because it was deleted somewhere else*, and nothing on the computer is deleted in response to a phone-side change.
+
+By default PhoneSync makes **no writes to the phone at all** (`read_only` is `true`). The one optional phone-side write is move propagation: when you've reorganized photos on the computer and pass `--apply-phone-moves`, PhoneSync may remove a file's *old* phone path after copy-verifying the same bytes exist at the *new* phone path. That's the only way a phone file is ever removed, it only happens when you opt in, and it's a move (verified copy then delete), never a plain delete.
 
 ## Features
 
 - **Multiple phones, one library** — photos from both phones merge into date-based folders; every copy is kept (duplicates are never silently dropped)
 - **Photo organization** — photos sorted into `photos/YYYY/` folders using EXIF data or a date parsed from the filename; photos with no usable date go to `photos/unsorted/`
-- **Move tracking** — sort photos into subfolders on your computer and the moves propagate to your phone(s)
+- **Move tracking** — sort photos into subfolders on your computer and the moves propagate to your phone(s) when you opt in with `--apply-phone-moves` (phone writes are off by default)
 - **Safe by default** — deleting from a phone never removes the computer copy; deleting from the computer never removes the phone copy; pulls are hash-verified against the phone to catch corrupt transfers; state is backed up before every write
 - **Collision handling** — two different files that need the same name in the same folder get device-suffixed names (e.g. `IMG_001_galaxy-s24.jpg`)
 - **Dry-run mode** — preview exactly what would happen, including destination paths, without changing anything
@@ -54,7 +56,6 @@ Data and configuration live in **two separate directories**:
 │   │   ├── IMG_20250115_123456.jpg
 │   │   └── vacation/              ← create subfolders to sort; moves sync back
 │   └── unsorted/                  ← photos without a parseable date
-|       └── IMG_001.jpg            ← (that means no date in filename, EXIF, or mtime)
 ├── downloads/
 │   ├── pixel-8/                   ← separated by device
 │   └── galaxy-s24/
@@ -80,7 +81,8 @@ Photos are sorted by **year only** (`photos/YYYY/`), not `YYYY/MM`.
 | `phonesync sync` | Sync all connected phones |
 | `phonesync sync -d SERIAL` | Sync a specific phone by ADB serial |
 | `phonesync sync -n` / `--dry-run` | Preview without changing anything |
-| `phonesync sync --read-only` | Sync but never write to the phone (skip move propagation) |
+| `phonesync sync --read-only` | Sync with no phone writes (this is the default) |
+| `phonesync sync --apply-phone-moves` | Enable phone writes for this run: propagate computer-side moves to the phone (alias `--allow-phone-writes`) |
 | `phonesync sync --overwrite-policy {ask,never,always}` | How to handle a file edited on both sides (overrides config for this run) |
 | `phonesync status` | Show config/data directories and per-device sync stats |
 | `phonesync devices` | List connected ADB devices, storage volumes, and approval status |
@@ -108,25 +110,19 @@ The **first** time you sync a given device, PhoneSync pauses and asks you to con
 ### 2. Sort on the computer
 Move photos into subfolders however you like:
 ```
-photos/2025/IMG_20250115_123456.jpg  →  photos/2025/vacation/IMG_20250115_123456_Yosemite.jpg
-```
-
-Delete photos you don't want to keep:
-```
-rm photos/unsorted/IMG_001.jpg
+photos/2025/IMG_001.jpg  →  photos/2025/vacation/IMG_001.jpg
 ```
 
 ### 3. Next sync
-PhoneSync detects the move and mirrors it on the phone:
+PhoneSync detects the move. Because phone writes are off by default, run the sync with `--apply-phone-moves` to mirror it on the phone:
 ```
-/sdcard/DCIM/Camera/IMG_20250115_123456.jpg  →  /sdcard/DCIM/Camera/vacation/IMG_20250115_123456_Yosemite.jpg
+phonesync sync --apply-phone-moves
+# /sdcard/DCIM/Camera/IMG_001.jpg  →  /sdcard/DCIM/Camera/vacation/IMG_001.jpg
 ```
-PhoneSync detects the deletion and marks the file as "not to sync again", but does not delete on the phone.
+Without that flag the move is detected and tracked but the phone is left untouched.
 
 ### 4. Phone cleanup
 Delete files from the phone to free space — they stay on the computer, and the tool will not re-download them.
-
-Sort files on the phone, and their movements will be synced to the computer next sync.
 
 ## Configuration
 
@@ -141,7 +137,7 @@ Edit `~/.phonesync/config.json`:
   "preserve_phone_subdirs": true,
   "verify_pulls": true,
   "use_library_index": true,
-  "read_only": false,
+  "read_only": true,
   "check_free_space": true,
   "free_space_margin_bytes": 104857600,
   "overwrite_policy": "ask",
@@ -174,16 +170,16 @@ Edit `~/.phonesync/config.json`:
 | `preserve_phone_subdirs` | `true` | Mirror the phone's subfolder structure under `downloads/`/`recordings/` and under the photo year folder. |
 | `verify_pulls` | `true` | After each pull, compare the copied bytes against the phone's own hash and discard the copy if they differ. Catches truncated transfers. Leave on. |
 | `use_library_index` | `true` | Cache content hashes of the library so syncs are faster and an interrupted move is recognized instead of re-pulled. |
-| `read_only` | `false` | Never write to the phone — skips the move-propagation step entirely. Reads/ingest still happen. Useful for a first cautious sync. |
+| `read_only` | `true` | No phone writes at all (the safe default). Reads/ingest still happen. Set to `false`, or pass `--apply-phone-moves` for a single run, to let computer-side moves propagate to the phone. |
 | `check_free_space` | `true` | Before pulling, estimate the bytes to copy and abort (without copying anything) if they wouldn't fit. |
 | `free_space_margin_bytes` | `104857600` (100 MB) | Headroom required on top of the estimate before a sync proceeds. |
 | `overwrite_policy` | `"ask"` | What to do when a file was edited on **both** the phone and the computer since the last sync. `ask` prompts (and keeps local if there's no terminal); `never` always keeps your local edits; `always` always takes the phone version. Can be set per-file (see below). |
-| `exclude_dirs` | (built-in list) | Folder names to skip everywhere (`.thumbnails`, `.trash`, caches…). **This is how you tell PhoneSync to ignore files**. |
+| `exclude_dirs` | (built-in list) | Folder names to skip everywhere (`.thumbnails`, `.trash`, caches…). **This is how you tell PhoneSync to ignore files** — by location, not by content. |
 | `exclude_files` | (built-in list) | Filename patterns to skip (`.nomedia`, `Thumbs.db`…). |
 
 `exclude_dirs` and `exclude_files` default to built-in lists; add entries in the config to extend them.
 
-### Edited on both sides: overwrite_policy and overwrite protection
+### Edited on both sides: overwrite protection
 
 Normally, if you edit a photo on the phone, the next sync re-pulls it and updates the computer copy. But if you *also* edited that file **on the computer** since the last sync (cropped it, fixed metadata, etc.), re-pulling would throw away your local edits. PhoneSync detects this — it compares the file's current on-disk hash against the hash it recorded at the last sync — and applies `overwrite_policy` only in that both-sides-changed case:
 
@@ -203,13 +199,13 @@ These keys may appear in a config and are accepted, but the current code does **
 | `propagate_computer_deletes_to_phone` | Mirror a computer-side deletion back to the phone. |
 | `conflict_resolution` | Choose the winner when a file is moved on both sides. |
 
-Today the tool **never deletes from the phone** regardless of the first two, and a move-on-both-sides conflict always resolves to the **computer's** location.
+Today the tool makes no phone writes by default; move propagation (the only phone-side write) happens only with `--apply-phone-moves` and is a verified copy-then-remove of the old path. A move-on-both-sides conflict always resolves to the **computer's** location.
 
 ## How It Works
 
 ### Duplicates: everything is kept
 
-Because content only flows phone → computer, every duplicate that exists is one *you* created on purpose: the same photo saved to two albums, a picture that landed on both phones (they're backups of each other), an app-state backup, and so on. PhoneSync treats all of these as intentional and **keeps every copy**. It never deletes or silently skips a file because its contents match another file.
+Because contents only flow phone → computer, every duplicate that exists is one *you* created on purpose: the same photo saved to two albums, a picture that landed on both phones (they're backups of each other), an app-state backup, and so on. PhoneSync treats all of these as intentional and **keeps every copy**. It never deletes or silently skips a file because its contents match another file.
 
 To *ignore* certain files, do it by **folder**, not by content — add the folder to `exclude_dirs` (this is how `.thumbnails`, `.trash`, and other caches are already skipped). "Ignore this location" is meaningful; "ignore these bytes because they repeat" is not, since the repetition is deliberate.
 
@@ -231,7 +227,7 @@ If the same file is moved to different locations on both the phone and the compu
 - Before pulling, a free-space check estimates the copy and aborts up front if it wouldn't fit, instead of failing partway with files half-copied.
 - A file edited on both the phone and the computer is never silently overwritten; see [overwrite protection](#edited-on-both-sides-overwrite-protection). Automated (non-interactive) runs keep the local copy by default.
 - A brand-new device must be explicitly approved before its first sync; unattended runs refuse to sync an unapproved device (which also scopes any auto-sync to devices you've OK'd).
-- `read_only` / `--read-only` disables every phone-side write for a cautious sync.
+- Phone writes are **off by default** (`read_only: true`). The only phone-side write — move propagation — happens only when you pass `--apply-phone-moves` (alias `--allow-phone-writes`), and even then it's a copy-verify-then-remove of the old path, never a plain delete.
 
 ## Running the tests
 
@@ -246,7 +242,7 @@ The tests use a local-filesystem fake for ADB, so no phone is needed. The runner
 
 These are described here as goals, not current behavior:
 
-- **Auto-sync on plug-in** — a udev rule + systemd service to run `sync` automatically when a phone is connected. An **experimental** uv-based installer is included (`./install.sh --with-service`); it installs the launcher, a systemd unit, and a udev rule. It's opt-in and still rough. The approved-devices registry provides the key safety scoping regardless: an unattended sync only touches devices you've approved with `phonesync devices --approve`, so an unknown phone plugged in is skipped, not synced. Setup is manual — see below.
+- **Auto-sync on plug-in** — a udev rule + systemd service to run `sync` automatically when a phone is connected. An **experimental** uv-based installer ships in `contrib/` (`./contrib/install.sh --with-service`); it installs the launcher, a systemd unit, and a udev rule. It's opt-in and still rough. The approved-devices registry provides the key safety scoping regardless: an unattended sync only touches devices you've approved with `phonesync devices --approve`, so an unknown phone plugged in is skipped, not synced. Setup is manual — see below.
 
 ### Setting up auto-sync (experimental)
 
@@ -292,9 +288,6 @@ Notes: the rule matches on the **USB hardware serial**, which is set by `--appro
 - **`phonesync doctor`** — verify that the phone's `find`/`stat`/`printf` scan command behaves as expected on the device's toybox before trusting a large sync.
 - The reserved config keys listed above.
 
-## Notes / ideas / future features
+## Notes / ideas
 
 - Per-source-directory configurable destinations.
-- Multiple destination directories (currently all phones map to subfolders of the same PhoneSync directory)
-- Progress bar / time estimation (and early abort?)
-
