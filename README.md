@@ -74,6 +74,29 @@ Data and configuration live in **two separate directories**:
 
 Photos are sorted by **year only** (`photos/YYYY/`), not `YYYY/MM`.
 
+### Folder layout: years are a fallback, hand-sorted folders win
+
+PhoneSync treats your camera app's auto-generated folder (`Camera`, on stock Android) as **structural noise** — a "transparent" folder that carries no meaning, the same way a year folder is just a UI-management bucket. Everything else under `DCIM/` is assumed to be **hand-sorted** and meaningful.
+
+The rule: **a photo is year-bucketed only if it has no meaningful folder. Any meaningful folder replaces the year entirely.**
+
+| On the phone | On the computer |
+|---|---|
+| `DCIM/Camera/IMG_20260601.jpg` | `photos/2026/IMG_20260601.jpg` (loose → year bucket) |
+| `DCIM/Camera/<undated>.jpg` | `photos/unsorted/<undated>.jpg` |
+| `DCIM/Visa/scan.jpg` | `photos/Visa/scan.jpg` (folder replaces year) |
+| `DCIM/Screenshots/meme.png` | `photos/Screenshots/meme.png` |
+| `DCIM/명함정리/card.jpg` | `photos/명함정리/card.jpg` |
+
+This is symmetric, so reorganizing on the computer maps back to the phone predictably (and only when you've enabled phone writes with `--apply-phone-moves`):
+
+- **Sort a loose photo into a folder** — move `photos/2026/IMG.jpg` → `photos/Visa/IMG.jpg`, and the file moves into `DCIM/Visa/` on the phone.
+- **Sort within a year first, then archive** — move `photos/2026/IMG.jpg` → `photos/2026/명함정리/IMG.jpg` (propagates to `DCIM/명함정리/`), then later move it up to `photos/명함정리/IMG.jpg`. That second "archive" move is a **no-op on the phone**: both computer paths map to the same `DCIM/명함정리/`, so nothing moves — it's pure computer-side housekeeping.
+
+To use this, point your `photos` source at `/sdcard/DCIM` (so every subfolder flows through) and leave `transparent_dirs` at its default `["Camera"]`. Add other auto-generated folder names to `transparent_dirs` if your device uses them; a folder you *want* to keep as organization (like `Screenshots`) should **not** be listed there.
+
+Edge case: a transparent folder that itself contains subfolders (e.g. `DCIM/Camera/sub/x.jpg`, rare on Android) is kept whole as `photos/Camera/sub/` rather than flattened, so the round-trip stays correct.
+
 ## Commands
 
 | Command | Description |
@@ -180,7 +203,8 @@ Edit `~/.phonesync/config.json`:
 |--------|---------|--------|
 | `photo_date_folders` | `true` | Sort photos into `photos/YYYY/` by EXIF/filename date. `false` puts them flat under `photos/`. |
 | `recursive_scan` | `true` | Scan subdirectories of each source. `false` scans only the top level. |
-| `preserve_phone_subdirs` | `true` | Mirror the phone's subfolder structure under `downloads/`/`recordings/` and under the photo year folder. |
+| `preserve_phone_subdirs` | `true` | Mirror the phone's subfolder structure under `downloads/`/`recordings/`, and for photos use the "folder replaces year" rule (see [Folder layout](#folder-layout-years-are-a-fallback-hand-sorted-folders-win)). `false` ignores phone subfolders entirely (pure year bucketing). |
+| `transparent_dirs` | `["Camera"]` | Phone folder names treated as structural noise: a photo sitting directly in one is "loose" and year-bucketed, instead of foldered. Any other folder is meaningful and replaces the year. |
 | `verify_pulls` | `true` | After each pull, compare the copied bytes against the phone's own hash and discard the copy if they differ. Catches truncated transfers. Leave on. |
 | `use_library_index` | `true` | Cache content hashes of the library so syncs are faster and an interrupted move is recognized instead of re-pulled. |
 | `read_only` | `true` | No phone writes at all (the safe default). Reads/ingest still happen. Set to `false`, or pass `--apply-phone-moves` for a single run, to let computer-side moves propagate to the phone. |

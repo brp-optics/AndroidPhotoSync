@@ -121,6 +121,15 @@ def default_config(config_dir: str = None, data_dir: str = None):
         "photo_date_folders": True,
         "recursive_scan": True,   # Scan subdirectories on phone
         "preserve_phone_subdirs": True,  # Maintain subdirectory structure from phone
+        # Phone folder names that carry NO meaning — they're auto-generated
+        # by the camera app, not hand-sorted. A photo sitting DIRECTLY in one
+        # of these is treated as "loose" (no meaningful folder), so it gets
+        # year-bucketed into photos/YYYY/ instead of photos/<folder>/. Any
+        # OTHER subfolder (Visa, Screenshots, ...) is meaningful and replaces
+        # the year. The reverse mapping sends a loose photo back into the
+        # FIRST transparent dir. See the "Folder layout" section of the
+        # README. Default ["Camera"] matches stock Android.
+        "transparent_dirs": ["Camera"],
         "verify_pulls": True,     # Hash-verify each pull against the phone
         "use_library_index": True,  # Cache library hashes; complete partial moves
         "read_only": True,        # Safe default: no phone writes. Move
@@ -1298,32 +1307,57 @@ class SyncEngine:
         else:
             return self.data_dir / category / self.device_name
 
+    def _meaningful_subdir(self, phone_relpath: str) -> str:
+        """The hand-curated folder portion of a phone relpath, with any
+        leading TRANSPARENT dir (e.g. Camera) stripped.
+
+        A file sitting DIRECTLY in a transparent dir is "loose" -> returns "".
+        A file in any other folder keeps that folder. A transparent dir that
+        itself contains subfolders (DCIM/Camera/sub/x.jpg — rare on Android)
+        is treated as MEANINGFUL and kept whole, so the round-trip stays
+        safe (we can't know to re-insert Camera otherwise). Approved design.
+        """
+        subdir = os.path.dirname(phone_relpath)
+        if not subdir:
+            return ""
+        transparent = self.cfg.get("transparent_dirs", ["Camera"])
+        parts = subdir.split("/")
+        # Only strip when the WHOLE subdir is exactly one transparent dir.
+        if len(parts) == 1 and parts[0] in transparent:
+            return ""
+        return subdir
+
     def _compute_photo_dest(self, local_tmp: str, filename: str,
                             phone_relpath: str,
                             phone_mtime_epoch: int = None) -> Path:
         """Compute destination path for a photo.
 
-        Photos go into photos/YYYY/ based on EXIF or filename date.
-        If the file came from a subdirectory (e.g. KakaoTalk/), we preserve
-        that structure under the year folder.
+        Rule: a photo is year-bucketed ONLY if it has no meaningful folder.
+        Any meaningful folder (Visa, Screenshots, ...) replaces the year
+        entirely. A loose photo (directly in a transparent dir like Camera,
+        or with no subfolder at all) goes to photos/YYYY/ (or photos/unsorted/
+        if undated).
+          DCIM/Camera/IMG.jpg   -> photos/2026/IMG.jpg
+          DCIM/Visa/scan.jpg    -> photos/Visa/scan.jpg
+          DCIM/Screenshots/m.png-> photos/Screenshots/m.png
         """
         base = self.data_dir / "photos"
 
+        if not self.cfg.get("preserve_phone_subdirs", True):
+            # Subdir preservation off: fall back to pure year/unsorted/flat.
+            meaningful = ""
+        else:
+            meaningful = self._meaningful_subdir(phone_relpath)
+
+        if meaningful:
+            # Hand-curated folder replaces the year entirely.
+            return base / meaningful
+
+        # Loose photo: year-bucket it (or unsorted if undated).
         if self.cfg.get("photo_date_folders", True):
             date = get_photo_date(local_tmp, phone_mtime_epoch)
-            if date:
-                date_dir = base / str(date.year)
-            else:
-                date_dir = base / "unsorted"
-        else:
-            date_dir = base
-
-        # Preserve subdirectory structure from phone if configured
-        if self.cfg.get("preserve_phone_subdirs", True):
-            subdir = os.path.dirname(phone_relpath)
-            if subdir:
-                return date_dir / subdir
-        return date_dir
+            return base / (str(date.year) if date else "unsorted")
+        return base
 
     def _is_relevant_file(self, filename: str, category: str) -> bool:
         ext = Path(filename).suffix.lower()
@@ -2503,10 +2537,17 @@ class SyncEngine:
     def _compute_desired_phone_path(self, computer_path: Path,
                                      info: dict) -> Optional[str]:
         """Compute where a file should be on the phone based on its
-        computer location.
+        computer location. This is the exact INVERSE of _compute_photo_dest,
+        so a file that hasn't really moved produces its current phone path
+        (no phantom move).
 
-        Strips auto-generated structure (photos/, year folders) and
-        mirrors meaningful subfolder names to the phone.
+        Strip photos/, then strip a leading YYYY or 'unsorted' IF present.
+        Whatever remains is the meaningful folder:
+          - remains empty  -> file is loose -> first transparent dir (Camera)
+          - remains a path -> DCIM/<that path>/
+          photos/2026/IMG.jpg      -> <source>/Camera/IMG.jpg
+          photos/Visa/scan.jpg     -> <source>/Visa/scan.jpg
+          photos/Screenshots/m.png -> <source>/Screenshots/m.png
         """
         phone_source = info.get("phone_source_dir", "")
         if not phone_source:
@@ -2520,20 +2561,33 @@ class SyncEngine:
 
         subfolder_parts = list(rel.parent.parts)
 
-        # Strip auto-generated leading structure only
         meaningful = list(subfolder_parts)
-        if meaningful and meaningful[0] == "photos":
+        is_photo = bool(meaningful) and meaningful[0] == "photos"
+        if is_photo:
             meaningful.pop(0)
+            # Strip a leading year or 'unsorted' (the auto-generated bucket
+            # for loose photos) only if it's actually there.
             if meaningful and re.match(r'^\d{4}$', meaningful[0]):
                 meaningful.pop(0)
-        if meaningful and meaningful[0] == "unsorted":
-            meaningful.pop(0)
+            elif meaningful and meaningful[0] == "unsorted":
+                meaningful.pop(0)
 
         if meaningful:
             extra = "/".join(meaningful)
             return f"{phone_source}/{extra}/{phone_filename}"
-        else:
-            return f"{phone_source}/{phone_filename}"
+
+        # Loose photo (nothing meaningful left): it belongs in the first
+        # transparent dir on the phone (Camera), matching the forward rule —
+        # BUT only if the source dir isn't already the transparent dir (or a
+        # path ending in it). When photos source is /sdcard/DCIM/Camera, the
+        # file lives directly in the source and no Camera segment is added;
+        # when the source is /sdcard/DCIM, a loose photo goes into Camera/.
+        if is_photo:
+            transparent = self.cfg.get("transparent_dirs", ["Camera"])
+            src_last = os.path.basename(phone_source.rstrip("/"))
+            if transparent and src_last not in transparent:
+                return f"{phone_source}/{transparent[0]}/{phone_filename}"
+        return f"{phone_source}/{phone_filename}"
 
     def _find_file_by_hash(self, target_hash: str,
                            previous_path: Path = None) -> Optional[Path]:

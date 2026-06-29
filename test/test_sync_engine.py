@@ -2511,6 +2511,141 @@ class TestDiscoveredSubdirs:
 # P1: date organization — explicit priority order
 # ---------------------------------------------------------------------------
 
+class TestTransparentDirs:
+    """transparent_dirs (default ['Camera']): a photo directly in a
+    transparent phone folder is 'loose' and year-bucketed; any other folder
+    is meaningful and REPLACES the year. Forward and reverse mappings must
+    round-trip so reorganizing on the computer produces correct (and only
+    intended) phone moves. (transparent_dirs feature.)"""
+
+    def _use_dcim_source(self, harness):
+        """Point the photos source at /sdcard/DCIM so subfolders flow
+        through (Camera, Visa, Screenshots, ...)."""
+        cfg = phonesync.load_config()
+        cfg["devices"]["SERIAL_A"]["sources"]["photos"] = ["/sdcard/DCIM"]
+        phonesync.save_config(cfg)
+
+    # ---- forward (ingest) layout ----
+
+    def test_camera_is_year_bucketed(self, harness):
+        self._use_dcim_source(harness)
+        harness.phone_write(
+            "a", "DCIM/Camera/IMG_20260601_120000.jpg", b"cam", 1717243200.0)
+        harness.sync("a")
+        assert harness.computer_exists("photos/2026/IMG_20260601_120000.jpg")
+
+    def test_meaningful_folder_replaces_year(self, harness):
+        self._use_dcim_source(harness)
+        harness.phone_write(
+            "a", "DCIM/Visa/scan_20260601.jpg", b"visa", 1717243200.0)
+        harness.sync("a")
+        # No year anywhere — the folder replaces it.
+        assert harness.computer_exists("photos/Visa/scan_20260601.jpg")
+        assert not harness.computer_exists("photos/2026/Visa/scan_20260601.jpg")
+
+    def test_screenshots_is_meaningful(self, harness):
+        self._use_dcim_source(harness)
+        harness.phone_write(
+            "a", "DCIM/Screenshots/meme_20260601.png", b"png", 1717243200.0)
+        harness.sync("a")
+        assert harness.computer_exists("photos/Screenshots/meme_20260601.png")
+        assert not harness.computer_exists("photos/2026/Screenshots/meme_20260601.png")
+
+    def test_unicode_folder_preserved(self, harness):
+        self._use_dcim_source(harness)
+        harness.phone_write(
+            "a", "DCIM/명함정리/card_20260601.jpg", b"card", 1717243200.0)
+        harness.sync("a")
+        assert harness.computer_exists("photos/명함정리/card_20260601.jpg")
+
+    def test_camera_subfolder_kept_whole(self, harness):
+        """Edge case (approved): a transparent dir WITH a subfolder is kept
+        whole, since we can't safely re-insert Camera on the reverse."""
+        self._use_dcim_source(harness)
+        harness.phone_write(
+            "a", "DCIM/Camera/sub/IMG_20260601.jpg", b"x", 1717243200.0)
+        harness.sync("a")
+        assert harness.computer_exists("photos/Camera/sub/IMG_20260601.jpg")
+
+    # ---- round-trip: no spurious phone move ----
+
+    def test_camera_roundtrips_no_move(self, harness):
+        self._use_dcim_source(harness)
+        harness.phone_write(
+            "a", "DCIM/Camera/IMG_20260601_120000.jpg", b"cam", 1717243200.0)
+        harness.sync("a")
+        # Second sync must detect NO phone move (forward/reverse agree).
+        engine = harness.sync("a")
+        assert engine.stats["phone_moves_detected"] == 0
+        assert engine.stats["partial_moves"] == 0
+
+    def test_visa_roundtrips_no_move(self, harness):
+        self._use_dcim_source(harness)
+        harness.phone_write(
+            "a", "DCIM/Visa/scan_20260601.jpg", b"visa", 1717243200.0)
+        harness.sync("a")
+        engine = harness.sync("a")
+        assert engine.stats["phone_moves_detected"] == 0
+
+    # ---- intended moves (computer reorg -> phone) ----
+
+    def test_loose_to_folder_propagates(self, harness):
+        """Sort a loose photo into a folder on the computer -> moves into
+        DCIM/<folder>/ on the phone (the whole point of the tool)."""
+        self._use_dcim_source(harness)
+        harness.phone_write(
+            "a", "DCIM/Camera/IMG_20260601_120000.jpg", b"cam", 1717243200.0)
+        harness.sync("a")
+        # Move on the computer: photos/2026/IMG.jpg -> photos/Visa/IMG.jpg
+        harness.computer_move(
+            "photos/2026/IMG_20260601_120000.jpg",
+            "photos/Visa/IMG_20260601_120000.jpg")
+        engine = harness.sync("a")  # harness has read_only False
+        # File moved on the phone into DCIM/Visa/.
+        assert harness.phone_exists(
+            "a", "DCIM/Visa/IMG_20260601_120000.jpg")
+        assert not harness.phone_exists(
+            "a", "DCIM/Camera/IMG_20260601_120000.jpg")
+
+    def test_folder_to_loose_propagates(self, harness):
+        """Move a foldered photo back to loose (year) -> returns to
+        DCIM/Camera/ on the phone."""
+        self._use_dcim_source(harness)
+        harness.phone_write(
+            "a", "DCIM/Visa/scan_20260601.jpg", b"visa", 1717243200.0)
+        harness.sync("a")
+        harness.computer_move(
+            "photos/Visa/scan_20260601.jpg",
+            "photos/2026/scan_20260601.jpg")
+        engine = harness.sync("a")
+        assert harness.phone_exists("a", "DCIM/Camera/scan_20260601.jpg")
+        assert not harness.phone_exists("a", "DCIM/Visa/scan_20260601.jpg")
+
+    def test_folder_move_up_out_of_year_is_noop_on_phone(self, harness):
+        """The archive step: photos/2026/명함정리/ -> photos/명함정리/ must NOT
+        move anything on the phone (both map to DCIM/명함정리/)."""
+        self._use_dcim_source(harness)
+        # First, create a foldered-within-year file by sorting a loose one.
+        harness.phone_write(
+            "a", "DCIM/Camera/IMG_20260601_120000.jpg", b"cam", 1717243200.0)
+        harness.sync("a")
+        harness.computer_move(
+            "photos/2026/IMG_20260601_120000.jpg",
+            "photos/2026/명함정리/IMG_20260601_120000.jpg")
+        harness.sync("a")  # propagates to DCIM/명함정리/
+        assert harness.phone_exists(
+            "a", "DCIM/명함정리/IMG_20260601_120000.jpg")
+        # Now the archive move: up out of the year.
+        harness.computer_move(
+            "photos/2026/명함정리/IMG_20260601_120000.jpg",
+            "photos/명함정리/IMG_20260601_120000.jpg")
+        engine = harness.sync("a")
+        # No phone move: both computer paths map to the same phone path.
+        assert engine.stats["phone_moves_detected"] == 0
+        assert harness.phone_exists(
+            "a", "DCIM/명함정리/IMG_20260601_120000.jpg")
+
+
 class TestDatePriority:
     def test_filename_date_beats_mtime(self, harness):
         """Filename date (2023) wins over mtime (2025)."""
