@@ -159,7 +159,7 @@ class TestSyncEngineDuplicates:
         
         assert engine.stats["files_copied"] == 2
         assert h.computer_exists("photos/2025/IMG_20250115.jpg")
-        assert h.computer_exists("photos/2025/Sub/IMG_20250115.jpg")
+        assert h.computer_exists("photos/Sub/IMG_20250115.jpg")
         assert h.state_file_count("a") == 2
 
     def test_existing_library_content_does_not_suppress_normal_new_phone_file(
@@ -543,7 +543,7 @@ class TestSyncEngineRecursiveScan:
 
         h.sync("a")
 
-        assert h.computer_read("photos/2025/Sub/IMG_20250115.jpg") == b"sub photo"
+        assert h.computer_read("photos/Sub/IMG_20250115.jpg") == b"sub photo"
 
     def test_recursive_scan_false_reports_unscanned_subdirectories(self, harness):
         h = harness
@@ -557,7 +557,7 @@ class TestSyncEngineRecursiveScan:
         engine = h.sync("a")
 
         assert engine.stats["files_copied"] == 0
-        assert not h.computer_exists("photos/2025/Sub/IMG_20250115.jpg")
+        assert not h.computer_exists("photos/Sub/IMG_20250115.jpg")
         assert any(
             parent == "/sdcard/DCIM/Camera" and name == "Sub" and status == "not_scanned"
             for parent, name, count, status in engine.discovered_subdirs
@@ -648,7 +648,7 @@ class TestSyncEnginePhotoDateOrganization:
 
         assert h.computer_exists("photos/IMG_20250115.jpg")
 
-    def test_preserve_phone_subdirs_true_preserves_subdir_under_year(
+    def test_preserve_phone_subdirs_true_meaningful_folder_replaces_year(
         self, harness
     ):
         h = harness
@@ -659,7 +659,8 @@ class TestSyncEnginePhotoDateOrganization:
 
         h.sync("a")
 
-        assert h.computer_exists("photos/2025/Album/IMG_20250115.jpg")
+        assert h.computer_exists("photos/Album/IMG_20250115.jpg")
+        assert not h.computer_exists("photos/2025/Album/IMG_20250115.jpg")
 
     def test_preserve_phone_subdirs_false_flattens_photo_destination(
         self, harness

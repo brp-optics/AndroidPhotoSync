@@ -97,6 +97,25 @@ To use this, point your `photos` source at `/sdcard/DCIM` (so every subfolder fl
 
 Edge case: a transparent folder that itself contains subfolders (e.g. `DCIM/Camera/sub/x.jpg`, rare on Android) is kept whole as `photos/Camera/sub/` rather than flattened, so the round-trip stays correct.
 
+### Custom categories
+
+The three built-in categories — `photos`, `downloads`, `recordings` — aren't the only ones you can use. Any other name in a device's `sources` becomes a **custom category** that lands at `data_dir/<category>/<device>/`, preserving the phone's subfolder structure. For example:
+
+```json
+"sources": {
+  "photos": ["/sdcard/DCIM", "/sdcard/Pictures", "/sdcard/Movies"],
+  "downloads": ["/sdcard/Download"],
+  "recordings": ["/sdcard/Recordings"],
+  "music": ["/sdcard/Music"],
+  "audiobooks": ["/sdcard/Audiobooks"],
+  "documents": ["/sdcard/Documents"]
+}
+```
+
+A file at `Music/Korean/song.mp3` then lands at `music/sm-s906n/Korean/song.mp3`. Custom categories accept files of any type (no extension filtering), and like `downloads`/`recordings` they do **not** get photo treatment: no year bucketing, and **computer-side moves are not propagated back to the phone** (a file you reorganize under `music/` on the computer stays put on the phone, though the move is tracked so it isn't re-pulled). Deletions are tombstoned the same way as any other category.
+
+Category names must be a single safe path segment — no slashes, no `..`, no leading dot — since each becomes a directory under your data dir. An invalid name aborts the run rather than writing somewhere unexpected. Note that `detect-paths` only auto-suggests the three built-in categories; add custom ones to your config by hand.
+
 ## Commands
 
 | Command | Description |
@@ -295,7 +314,15 @@ Android's userland (toybox/busybox) varies between builds, and PhoneSync leans o
 phonesync doctor              # or -d SERIAL for one device
 ```
 
-It runs each of those commands against a throwaway directory on the phone — including a scan of a file whose name contains a newline, to confirm the NUL-safe scanner works — and reports pass/fail. If a critical check fails it exits non-zero, which is your signal not to rely on automated syncing for that device yet. Write checks (`cp`) are only treated as critical when phone writes are enabled.
+It runs each of those commands against a throwaway directory on the phone — including a scan of a file whose name contains a space and non-ASCII characters, to confirm the scanner handles realistic tricky filenames — and reports pass/fail. If a critical check fails it exits non-zero, which is your signal not to rely on automated syncing for that device yet. Write checks (`cp`) are only treated as critical when phone writes are enabled.
+
+**Before enabling phone writes**, validate the write path explicitly:
+
+```bash
+phonesync doctor --check-writes
+```
+
+This promotes the write probes (`mkdir`, `cp`, and a full `move_safe` round-trip) to **critical**, even while your config is still `read_only`. The `move_safe` probe is the important one: it exercises the exact copy-verify-delete primitive that move propagation uses — creating a file, moving it with hash verification, confirming the destination landed *and* the source was removed, then moving it back. `cp` working doesn't prove this; the source-removal step is what carries the partial-move risk, so it's tested directly. A clean `doctor --check-writes` on your real phone is the recommended gate before your first `sync --apply-phone-moves` (or setting `read_only: false`).
 
 ### Reviewing a plan before a real sync
 

@@ -3313,9 +3313,12 @@ def run_doctor(adb, cfg, want_phone_writes=False, device_name=""):
     before trusting a real library. (TODO item H, absorbs old #15.)
 
     `adb` is an ADB-like instance (real or a test double). Probes that would
-    write to the phone (mkdir/cp/mv/rm) are marked critical only when
-    want_phone_writes is True (move propagation enabled); read/scan probes are
-    always critical.
+    write to the phone (mkdir/cp/mv/rm, and the move_safe round-trip) are
+    marked critical only when want_phone_writes is True (i.e. you intend to
+    run with --apply-phone-moves, or have set read_only:false); read/scan
+    probes are always critical. The move_safe probe exercises the EXACT
+    copy-verify-delete primitive sync uses for move propagation, including the
+    source-removal step that creates partial-move risk.
     """
     results = []
 
@@ -3327,9 +3330,20 @@ def run_doctor(adb, cfg, want_phone_writes=False, device_name=""):
     # A temp working dir on the phone. Under /sdcard so it's writable and on
     # the same volume the tool reads from.
     probe_dir = "/sdcard/.phonesync-doctor"
-    # A filename containing a NEWLINE, to exercise the NUL-separated scanner
-    # format (#11): if find/printf mangle this, the scan is unsafe.
-    tricky_name = "doctor probe\nline2.txt"
+    # Plain-named file for the byte-level probes (stat/sha/cp). Created with a
+    # shell redirect, which is reliable ONLY for names without shell-special
+    # bytes — so this name is deliberately boring.
+    plain_path = f"{probe_dir}/doctor_probe.txt"
+    # A file whose name has a SPACE and a non-ASCII (unicode) char, to
+    # exercise the scanner on realistic "tricky" names (your phone has files
+    # like "통화 녹음 ....m4a"). This goes through the exact NUL-separated
+    # find/printf/stat path the sync uses (#11). We do NOT embed a literal
+    # NEWLINE in a shell command here — that splits the command and silently
+    # fails to create the file (the bug this probe used to have). Newline
+    # round-tripping is covered by the unit tests
+    # (test_real_adb.test_newline_in_filename); a space+unicode name exercises
+    # the same uniform NUL parsing on the real device.
+    tricky_name = "doctor probe 통화.txt"
     tricky_path = f"{probe_dir}/{tricky_name}"
 
     # 1. adb reachable / shell works at all.
@@ -3361,42 +3375,52 @@ def run_doctor(adb, cfg, want_phone_writes=False, device_name=""):
         # Can't run file-level probes without the probe dir.
         return results
 
-    # Create the tricky-named test file (write via the phone shell, using a
-    # redirect; if this fails we still try the rest).
-    try:
-        adb.shell(f"printf 'hello' > {q(tricky_path)}", check=False)
-    except Exception:
-        pass
-    file_there = "EXISTS" in adb.shell(
-        f"[ -e {q(tricky_path)} ] && echo EXISTS || echo MISSING",
+    # Create the probe files. Both names are free of shell-special bytes
+    # (no newline), so a redirect creates them reliably. Verify the plain
+    # one actually appeared before trusting the byte-level probes.
+    adb.shell(f"printf 'hello' > {q(plain_path)}", check=False)
+    adb.shell(f"printf 'hello' > {q(tricky_path)}", check=False)
+    plain_there = "EXISTS" in adb.shell(
+        f"[ -e {q(plain_path)} ] && echo EXISTS || echo MISSING",
         check=False)
+    if not plain_there:
+        record("create probe file", False, True,
+               "could not create a test file via 'printf > path'")
+        # Without a test file nothing below is meaningful.
+        try:
+            adb.shell(f"rm -rf {q(probe_dir)}", check=False)
+        except Exception:
+            pass
+        return results
+    record("create probe file", True, True, "")
 
     # 3. stat -c %s / %Y (size + mtime; the scan depends on both).
     try:
-        size = adb.shell(f'stat -c %s {q(tricky_path)}', check=False).strip()
-        mtime = adb.shell(f'stat -c %Y {q(tricky_path)}', check=False).strip()
+        size = adb.shell(f'stat -c %s {q(plain_path)}', check=False).strip()
+        mtime = adb.shell(f'stat -c %Y {q(plain_path)}', check=False).strip()
         ok = size.isdigit() and mtime.isdigit()
         record("stat -c %s / %Y", ok, True,
                "" if ok else f"size={size!r} mtime={mtime!r}")
     except Exception as e:
         record("stat -c %s / %Y", False, True, str(e))
 
-    # 4. The NUL-separated recursive scanner on a newline-containing filename.
+    # 4. The NUL-separated recursive scanner, on a space+unicode filename.
     #    This is the real list_files_recursive path (#11) — the strongest
-    #    single check that find + printf + stat cooperate safely.
+    #    single check that find + printf + stat cooperate on non-trivial,
+    #    realistic filenames the way your phone's actually are.
     try:
         listed = adb.list_files_recursive(probe_dir)
         names = [e["name"] for e in listed]
         ok = tricky_name in names
-        record("recursive scan (NUL-safe, newline filename)", ok, True,
+        record("recursive scan (space + unicode filename)", ok, True,
                "" if ok else f"scanned names={names!r}")
     except Exception as e:
-        record("recursive scan (NUL-safe, newline filename)", False, True,
+        record("recursive scan (space + unicode filename)", False, True,
                str(e))
 
     # 5. sha256sum (pull verification + move/library hashing depend on it).
     try:
-        h = adb.file_hash(tricky_path)
+        h = adb.file_hash(plain_path)
         ok = bool(h) and len(h) == 64
         record("sha256sum", ok, True,
                "" if ok else f"got hash={h!r}")
@@ -3406,7 +3430,7 @@ def run_doctor(adb, cfg, want_phone_writes=False, device_name=""):
     # 6. cp (only used when phone writes are enabled, for move propagation).
     try:
         cp_dst = f"{probe_dir}/doctor-cp-copy.txt"
-        adb.shell(f"cp {q(tricky_path)} {q(cp_dst)}", check=False)
+        adb.shell(f"cp {q(plain_path)} {q(cp_dst)}", check=False)
         ok = "EXISTS" in adb.shell(
             f"[ -e {q(cp_dst)} ] && echo EXISTS || echo MISSING",
             check=False)
@@ -3414,6 +3438,34 @@ def run_doctor(adb, cfg, want_phone_writes=False, device_name=""):
                "" if ok else "copy did not appear")
     except Exception as e:
         record("cp (phone writes)", False, want_phone_writes, str(e))
+
+    # 7. move_safe round-trip (THE operation --apply-phone-moves uses).
+    #    cp alone doesn't prove move propagation works: a real move is
+    #    copy-verify-DELETE, and the source-removal step is exactly what
+    #    creates the "partial move" risk. Exercise the actual move_safe
+    #    primitive (with hash verification) and confirm both the destination
+    #    lands AND the source is removed, then move it back.
+    try:
+        mv_dst = f"{probe_dir}/moved/doctor_probe_moved.txt"
+        src_hash = adb.file_hash(plain_path)
+        r1 = adb.move_safe(plain_path, mv_dst, expected_hash=src_hash)
+        dest_ok = adb.file_exists(mv_dst)
+        src_gone = not adb.file_exists(plain_path)
+        ok = (isinstance(r1, dict) and r1.get("ok") and
+              r1.get("source_deleted") and dest_ok and src_gone)
+        detail = ""
+        if not ok:
+            action = r1.get("action") if isinstance(r1, dict) else "?"
+            detail = (f"action={action!r} dest_exists={dest_ok} "
+                      f"source_gone={src_gone}")
+        record("move_safe round-trip (move propagation)", ok,
+               want_phone_writes, detail)
+        # Move it back so the plain file exists for cleanup/idempotence.
+        if dest_ok:
+            adb.move_safe(mv_dst, plain_path, expected_hash=src_hash)
+    except Exception as e:
+        record("move_safe round-trip (move propagation)", False,
+               want_phone_writes, str(e))
 
     # Cleanup: best-effort remove the probe dir.
     try:
@@ -3426,31 +3478,53 @@ def run_doctor(adb, cfg, want_phone_writes=False, device_name=""):
 
 def cmd_doctor(args):
     cfg = load_config()
-    want_writes = not cfg.get("read_only", True)
+    # Write probes are treated as CRITICAL if either the config already allows
+    # writes (read_only:false) OR the user explicitly asks to validate the
+    # write path with --check-writes. This lets you confirm move propagation
+    # works BEFORE flipping read_only / using --apply-phone-moves, without
+    # editing config.
+    want_writes = (not cfg.get("read_only", True)) or \
+        getattr(args, "check_writes", False)
+
+    connected = list_connected_devices()
+    connected_serials = {d["serial"] for d in connected}
 
     if args.device:
+        # Validate the serial is actually connected, rather than probing a
+        # phantom device and reporting a confusing "shell unreachable".
+        if args.device not in connected_serials:
+            print(f"Device '{args.device}' is not connected.")
+            if connected:
+                print("Connected devices: "
+                      + ", ".join(sorted(connected_serials)))
+            else:
+                print("No ADB devices connected. Connect a phone with USB "
+                      "debugging enabled.")
+            sys.exit(1)
         serials = [args.device]
     else:
-        devices = list_connected_devices()
-        if not devices:
+        if not connected:
             print("No ADB devices connected.")
             print("Connect a phone with USB debugging enabled.")
             sys.exit(1)
-        serials = [d["serial"] for d in devices]
+        serials = [d["serial"] for d in connected]
+
+    # Map serial -> model from the connection list, so the header is right
+    # even if get_model() comes back empty.
+    models = {d["serial"]: d.get("model", "") for d in connected}
 
     overall_ok = True
     for serial in serials:
         engine_adb = ADB(serial)
-        try:
-            name = engine_adb.get_model()
-        except Exception:
-            name = serial
+        name = models.get(serial) or serial
         print(f"\nphonesync doctor — {name} ({serial})")
         if want_writes:
-            print("  (phone writes ENABLED — checking write capabilities "
-                  "as critical)")
+            why = ("--check-writes" if getattr(args, "check_writes", False)
+                   and cfg.get("read_only", True) else "read_only:false")
+            print(f"  (validating phone WRITE path as critical — {why})")
         else:
-            print("  (phone writes off — write checks are informational)")
+            print("  (phone writes off — write checks are informational; "
+                  "use --check-writes before --apply-phone-moves)")
 
         results = run_doctor(engine_adb, cfg, want_phone_writes=want_writes,
                              device_name=name)
@@ -3779,6 +3853,11 @@ def main():
              "(find/stat/printf/sha256sum/cp) before trusting a real sync")
     p_doctor.add_argument(
         "-d", "--device", help="ADB device serial (default: all connected)")
+    p_doctor.add_argument(
+        "--check-writes", action="store_true",
+        help="Treat phone-write probes (mkdir/cp/move_safe) as CRITICAL, to "
+             "validate the move-propagation path before using "
+             "--apply-phone-moves or setting read_only:false")
 
     # adopt-existing
     p_adopt = subparsers.add_parser(

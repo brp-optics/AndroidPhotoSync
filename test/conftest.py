@@ -228,6 +228,14 @@ class FakeADB:
         # Strip surrounding quotes from content and path.
         content = content_part.strip().strip("'\"")
         remote = self._unquote(path_part)
+        # Model real `adb shell` behavior: a command containing a literal
+        # NEWLINE is split by the shell, so a redirect whose target name
+        # contains a newline does NOT create the intended file. (This is the
+        # exact bug `doctor` had — the probe must not rely on creating a
+        # newline-named file via a redirect.) Silently no-op, like the real
+        # device, so a regression is caught by the probe's existence check.
+        if "\n" in remote:
+            return ""
         local = self._local(remote)
         local.parent.mkdir(parents=True, exist_ok=True)
         local.write_text(content)

@@ -534,9 +534,98 @@ class TestDoctor:
         assert cp_on["ok"] is False
         assert cp_on["critical"] is True
 
+    def test_move_safe_probe_passes(self, harness):
+        """The move_safe round-trip probe runs and passes against a working
+        device, and is critical when writes are wanted."""
+        from conftest import FakeADB
+        res = phonesync.run_doctor(
+            FakeADB("SERIAL_A"), harness.cfg, want_phone_writes=True)
+        mv = self._results_by_name(res)[
+            "move_safe round-trip (move propagation)"]
+        assert mv["ok"] is True
+        assert mv["critical"] is True
+
+    def test_move_safe_probe_informational_without_writes(self, harness):
+        from conftest import FakeADB
+        res = phonesync.run_doctor(
+            FakeADB("SERIAL_A"), harness.cfg, want_phone_writes=False)
+        mv = self._results_by_name(res)[
+            "move_safe round-trip (move propagation)"]
+        # Passes, but only informational when writes aren't wanted.
+        assert mv["critical"] is False
+
+    def test_move_safe_probe_detects_unremoved_source(self, harness):
+        """If move_safe copies but FAILS to remove the source (the partial-
+        move failure mode), the probe flags it — this is the exact risk
+        --apply-phone-moves carries, so doctor must catch it."""
+        from conftest import FakeADB
+
+        class PartialMoveADB(FakeADB):
+            def move_safe(self, src, dst, expected_hash=None):
+                r = super().move_safe(src, dst, expected_hash=expected_hash)
+                # Simulate dest landing but source NOT removed.
+                if r.get("ok"):
+                    # Re-create the source so it's "left behind".
+                    self.shell(f"printf 'hello' > {self._q(src)}",
+                               check=False)
+                    r["source_deleted"] = False
+                return r
+
+        res = phonesync.run_doctor(
+            PartialMoveADB("SERIAL_A"), harness.cfg, want_phone_writes=True)
+        mv = self._results_by_name(res)[
+            "move_safe round-trip (move propagation)"]
+        assert mv["ok"] is False
+        assert mv["critical"] is True
+        assert "source_gone=False" in mv["detail"]
+
+    def test_move_safe_probe_detects_failed_move(self, harness):
+        """If move_safe can't move at all (returns not-ok), the probe fails."""
+        from conftest import FakeADB
+
+        class NoMoveADB(FakeADB):
+            def move_safe(self, src, dst, expected_hash=None):
+                return {"ok": False, "action": "copy_failed",
+                        "source_deleted": False}
+
+        res = phonesync.run_doctor(
+            NoMoveADB("SERIAL_A"), harness.cfg, want_phone_writes=True)
+        mv = self._results_by_name(res)[
+            "move_safe round-trip (move propagation)"]
+        assert mv["ok"] is False
+        assert "copy_failed" in mv["detail"]
+
+    def test_check_writes_flag_forces_critical(self, harness):
+        """--check-writes treats write probes as critical even when config is
+        read_only. Tests the cmd_doctor gating decision for both config
+        states."""
+        from conftest import FakeADB
+
+        # The decision cmd_doctor makes: want = (not read_only) or check_writes
+        def decide(read_only, check_writes):
+            return (not read_only) or check_writes
+
+        assert decide(read_only=True, check_writes=True) is True
+        assert decide(read_only=True, check_writes=False) is False
+        assert decide(read_only=False, check_writes=False) is True
+
+        # And with want True, the write probes are critical.
+        cfg = phonesync.load_config()
+        res = phonesync.run_doctor(
+            FakeADB("SERIAL_A"), cfg, want_phone_writes=True)
+        for name in ["cp (phone writes)",
+                     "move_safe round-trip (move propagation)"]:
+            assert self._results_by_name(res)[name]["critical"] is True
+        # With want False, the same probes are informational.
+        res2 = phonesync.run_doctor(
+            FakeADB("SERIAL_A"), cfg, want_phone_writes=False)
+        for name in ["cp (phone writes)",
+                     "move_safe round-trip (move propagation)"]:
+            assert self._results_by_name(res2)[name]["critical"] is False
+
     def test_detects_unsafe_scan(self, harness):
-        """If the recursive scan can't round-trip a newline filename, that's
-        a critical failure (the #11 NUL-safety guarantee is broken)."""
+        """If the recursive scan can't round-trip the probe filename, that's
+        a critical failure (the scanner can't see files reliably)."""
         from conftest import FakeADB
 
         class BadScanADB(FakeADB):
@@ -547,6 +636,44 @@ class TestDoctor:
         scan = [r for r in res if "recursive scan" in r["name"]][0]
         assert scan["ok"] is False
         assert scan["critical"] is True
+
+    def test_probe_does_not_rely_on_newline_filename(self, harness):
+        """Regression for the real-device bug: the probe must create its test
+        file with a name a shell redirect can actually create. FakeADB models
+        the real `adb shell` behavior where a literal newline in the command
+        splits it and the file is never created. If the probe used a
+        newline-named file (the old bug), 'create probe file' would fail —
+        confirm it does NOT."""
+        from conftest import FakeADB
+        res = phonesync.run_doctor(FakeADB("SERIAL_A"), harness.cfg,
+                                   want_phone_writes=True)
+        by_name = {r["name"]: r for r in res}
+        # The probe file is created, and every critical check passes.
+        assert by_name["create probe file"]["ok"] is True
+        assert all(r["ok"] for r in res), \
+            [r["name"] for r in res if not r["ok"]]
+        # And the scan probe uses a space+unicode name (not a newline).
+        scan = [r for r in res if "recursive scan" in r["name"]][0]
+        assert "space + unicode" in scan["name"]
+
+    def test_detects_uncreatable_probe_file(self, harness):
+        """If a test file can't be created at all (write redirect fails),
+        doctor reports 'create probe file' as a critical failure and stops,
+        rather than cascading confusing stat/scan/sha failures."""
+        from conftest import FakeADB
+
+        class NoWriteADB(FakeADB):
+            def _shell_printf_write(self, cmd):
+                return ""   # silently fail to create any file
+
+        res = phonesync.run_doctor(NoWriteADB("SERIAL_A"), harness.cfg)
+        names = [r["name"] for r in res]
+        assert "create probe file" in names
+        cpf = [r for r in res if r["name"] == "create probe file"][0]
+        assert cpf["ok"] is False and cpf["critical"] is True
+        # Probe stops after the failed creation — no stat/sha cascade.
+        assert "stat -c %s / %Y" not in names
+        assert "sha256sum" not in names
 
 
 class TestRecover:
