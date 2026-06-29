@@ -2511,6 +2511,117 @@ class TestDiscoveredSubdirs:
 # P1: date organization — explicit priority order
 # ---------------------------------------------------------------------------
 
+class TestCustomCategories:
+    """Arbitrary category names (e.g. 'music') map to data_dir/<category>/
+    <device>/ with phone subfolder structure preserved, accept all file
+    types, track deletions, and do NOT get photo treatment (no year bucket,
+    no phone move-back) — consistent with downloads/recordings."""
+
+    def _add_music(self, harness, source="/sdcard/Music"):
+        cfg = phonesync.load_config()
+        cfg["devices"]["SERIAL_A"]["sources"]["music"] = [source]
+        phonesync.save_config(cfg)
+
+    def test_custom_category_preserves_structure(self, harness):
+        self._add_music(harness)
+        harness.phone_write("a", "Music/Korean/song.mp3", b"a", 1717243200.0)
+        harness.phone_write(
+            "a", "Music/luke_road_trip_2022/CD1/track.mp3", b"b",
+            1717243200.0)
+        engine = harness.sync("a")
+        assert engine.stats["files_copied"] == 2
+        assert harness.computer_exists("music/phone-a/Korean/song.mp3")
+        assert harness.computer_exists(
+            "music/phone-a/luke_road_trip_2022/CD1/track.mp3")
+
+    def test_custom_category_accepts_any_extension(self, harness):
+        self._add_music(harness)
+        # A non-audio file in a music source is still ingested (custom
+        # categories don't filter by extension).
+        harness.phone_write("a", "Music/cover.pdf", b"pdf", 1717243200.0)
+        engine = harness.sync("a")
+        assert engine.stats["files_copied"] == 1
+        assert harness.computer_exists("music/phone-a/cover.pdf")
+
+    def test_custom_category_no_year_bucket(self, harness):
+        """Custom categories never get photo year-bucketing."""
+        self._add_music(harness)
+        harness.phone_write(
+            "a", "Music/IMG_20260601_120000.mp3", b"x", 1717243200.0)
+        harness.sync("a")
+        # Lands flat under the category, NOT under a year.
+        assert harness.computer_exists(
+            "music/phone-a/IMG_20260601_120000.mp3")
+        assert not harness.computer_exists(
+            "music/2026/IMG_20260601_120000.mp3")
+
+    def test_custom_category_stable_no_repull(self, harness):
+        self._add_music(harness)
+        harness.phone_write("a", "Music/Korean/song.mp3", b"a", 1717243200.0)
+        harness.sync("a")
+        engine = harness.sync("a")
+        assert engine.stats["files_copied"] == 0
+        assert engine.stats["files_skipped"] == 1
+
+    def test_custom_category_deletion_tombstoned(self, harness):
+        self._add_music(harness)
+        harness.phone_write("a", "Music/Korean/song.mp3", b"a", 1717243200.0)
+        harness.sync("a")
+        harness.computer_delete("music/phone-a/Korean/song.mp3")
+        engine = harness.sync("a")
+        assert engine.stats["local_deletions"] == 1
+        # Tombstoned: not re-pulled on a later sync.
+        engine2 = harness.sync("a")
+        assert engine2.stats["files_copied"] == 0
+        assert not harness.computer_exists("music/phone-a/Korean/song.mp3")
+
+    def test_custom_category_no_phone_move_propagation(self, harness):
+        """Reorganizing a custom-category file on the computer does NOT move
+        it on the phone (only photos propagate moves). The computer move is
+        still TRACKED so it isn't re-pulled."""
+        self._add_music(harness)
+        harness.phone_write("a", "Music/Korean/song.mp3", b"a", 1717243200.0)
+        harness.sync("a")
+        harness.computer_move(
+            "music/phone-a/Korean/song.mp3",
+            "music/phone-a/Sorted/song.mp3")
+        engine = harness.sync("a")
+        # No phone write, and not re-pulled as new.
+        assert engine.stats["phone_moves_detected"] == 0
+        assert engine.stats["files_copied"] == 0
+        assert harness.phone_exists("a", "Music/Korean/song.mp3")
+
+    # ---- validation ----
+
+    def test_invalid_category_name_rejected(self, harness):
+        for bad in ["../escape", "a/b", ".hidden", ""]:
+            cfg = phonesync.load_config()
+            cfg["devices"]["SERIAL_A"]["sources"][bad] = ["/sdcard/X"]
+            phonesync.save_config(cfg)
+            raised = False
+            try:
+                harness.sync("a")
+            except ValueError:
+                raised = True
+            assert raised, f"expected ValueError for category {bad!r}"
+            # Clean up for the next iteration.
+            cfg = phonesync.load_config()
+            del cfg["devices"]["SERIAL_A"]["sources"][bad]
+            phonesync.save_config(cfg)
+
+    def test_validate_category_name_unit(self):
+        for good in ["music", "audiobooks", "documents", "podcasts",
+                     "photos", "downloads", "recordings", "ok_name"]:
+            phonesync._validate_category_name(good)  # no raise
+        for bad in ["", "../x", "a/b", "a\\b", ".", "..", ".hidden", "  "]:
+            raised = False
+            try:
+                phonesync._validate_category_name(bad)
+            except ValueError:
+                raised = True
+            assert raised, f"expected reject for {bad!r}"
+
+
 class TestTransparentDirs:
     """transparent_dirs (default ['Camera']): a photo directly in a
     transparent phone folder is 'loose' and year-bucketed; any other folder

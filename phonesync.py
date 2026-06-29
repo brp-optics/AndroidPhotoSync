@@ -315,6 +315,36 @@ def get_data_dir(cfg: dict) -> Path:
     return Path(cfg["data_dir"])
 
 
+# Category names that map to a special on-disk layout. Any OTHER name is a
+# valid "custom" category that lands at data_dir/<name>/<device>/.
+_KNOWN_CATEGORIES = {"photos", "downloads", "recordings"}
+
+
+def _validate_category_name(category: str):
+    """A category becomes a directory name under the data dir, so it must be
+    a single safe path segment. Raises ValueError otherwise. Custom names
+    (e.g. 'music') are allowed; unsafe ones (path separators, '..', empty,
+    leading dot) are not."""
+    if not isinstance(category, str) or not category:
+        raise ValueError(f"Category name must be a non-empty string: "
+                         f"{category!r}")
+    if category in _KNOWN_CATEGORIES:
+        return
+    if "/" in category or "\\" in category or category in (".", ".."):
+        raise ValueError(
+            f"Invalid category name {category!r}: must not contain path "
+            f"separators or be '.'/'..'.")
+    if category.startswith("."):
+        raise ValueError(
+            f"Invalid category name {category!r}: must not start with '.' "
+            f"(hidden dirs are skipped by scans).")
+    # Disallow whitespace-only or names with control chars.
+    if category != category.strip() or any(ord(c) < 32 for c in category):
+        raise ValueError(
+            f"Invalid category name {category!r}: leading/trailing "
+            f"whitespace or control characters.")
+
+
 # ---------------------------------------------------------------------------
 # State Management
 # ---------------------------------------------------------------------------
@@ -1295,7 +1325,14 @@ class SyncEngine:
     ## TODO study this
     def _get_sources(self) -> dict:
         dev_cfg = self.cfg.get("devices", {}).get(self.device_serial, {})
-        return dev_cfg.get("sources", DEFAULT_PHONE_SOURCES)
+        sources = dev_cfg.get("sources", DEFAULT_PHONE_SOURCES)
+        # Validate category names: each becomes a directory under the data
+        # dir, so a malformed name (path separators, "..", empty, dotfile)
+        # could write outside the library or create junk. Custom categories
+        # are allowed (e.g. "music"), but must be a single clean segment.
+        for category in sources:
+            _validate_category_name(category)
+        return sources
 
     def _dest_dir_for_category(self, category: str) -> Path:
         if category == "photos":
@@ -1305,6 +1342,10 @@ class SyncEngine:
         elif category == "recordings":
             return self.data_dir / "recordings" / self.device_name
         else:
+            # Custom category: data_dir/<category>/<device>/ . Validated in
+            # _get_sources, but re-check here since this is the path-building
+            # choke point.
+            _validate_category_name(category)
             return self.data_dir / category / self.device_name
 
     def _meaningful_subdir(self, phone_relpath: str) -> str:
